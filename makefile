@@ -31,7 +31,7 @@ $(PROG) : $(PROG_OBJS)
 #################################################################
 
 MY_FC_FLAGS = $(FCfree)
-SRC_DIR = .
+SRC_DIR = src
 
 %.o: $(SRC_DIR)/%.f
 	$(FC) $(FCbasic) $(FCopenmp) $(MY_FC_FLAGS) -c $<
