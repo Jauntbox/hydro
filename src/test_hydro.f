@@ -12,22 +12,25 @@ module hydro
 	!Only solve the linear problem (eg. equations )
 	logical, parameter :: do_linear = .false.
 	logical, parameter :: use_pgplot = .true.
+	logical, parameter :: dbg = .false.		!If true, print debugging output to the screen
 	
 	!Domain size parameters
-	integer, parameter :: nz_vertical = 500		!Number of vertical zones in simulation
-	integer, parameter :: nz_horizontal = 10	!Number of Fourier modes in the horizontal
+	integer, parameter :: nz_vertical = 101		!Number of vertical zones in simulation
+	integer, parameter :: nz_horizontal = 50	!Number of Fourier modes in the horizontal
 	double precision, parameter :: dz = 1d0/(nz_vertical-1)	!spacing in the z-direction
-	double precision, parameter :: a = sqrt(1.0)	!horizontal/vertical length scale
+	double precision, parameter :: a = 3.0	!horizontal/vertical length scale
 	
 	!Timestep parameters:
 	double precision :: dt	!Gets set in initialize()
+	double precision, parameter :: fixed_dt = 3d-6	!If >0, then use this as the fixed dt value
 	!Number of old time steps to keep track of when time-stepping:
 	integer, parameter :: num_time_differences = 2
-	integer, parameter :: num_steps = 10000		!Number of time steps to take
+	integer, parameter :: num_steps = 100000		!Number of time steps to take
+	character (len=16) :: solver	!'RK2' or 'AB2' for now
 	
 	!Physical parameters:
-	double precision, parameter :: rayleigh = 4000.0	!Rayleigh number (dimensionless)
-	double precision, parameter :: prandtl = 0.1	!Prandtl number (dimensionless)
+	double precision, parameter :: rayleigh = 1d6	!Rayleigh number (dimensionless)
+	double precision, parameter :: prandtl = 0.5	!Prandtl number (dimensionless)
 	
 	!Numerical constants:
 	double precision, parameter :: pi = 4d0*atan(1d0)
@@ -70,6 +73,8 @@ module hydro
 		
 		dt = 0.8*dt
 		
+		if(fixed_dt > 0) dt = fixed_dt 
+		
 		write(*,*) 'Domain size parameters:'
 		write(*,'(a25,I25)') 'nz_horizontal:', nz_horizontal
 		write(*,'(a25,I25)') 'nz_vertical:', nz_vertical
@@ -99,8 +104,8 @@ module hydro
 		!Initialize the physical variables:
 		omega(:,:) = 0d0
 		psi(:,:) = 0d0
-		call random_number(omega)
-		omega = 10d0*omega - 5d0
+		!call random_number(omega)
+		!omega = 10d0*omega - 5d0
 		!call random_number(psi)
 		!psi = 10d0*psi - 5d0
 		temp(:,:) = 0d0
@@ -120,7 +125,9 @@ module hydro
 			z(k) = (k - 1)*dz
 			!Satisfies the boundary conditions:
 			temp(k,0) = 1d0 - z(k)
-			temp(k,3:4) = sin(pi*z(k))
+			!temp(k,1) = 0.01*sin(pi*z(k))
+			temp(k,2) = 0.01*sin(pi*z(k))
+			temp(k,8) = 0.01*sin(pi*z(k))
 			!temp(k,1:nz_horizontal) = sin(pi*z(k))
 		end do
 		do k=1,nz_vertical
@@ -210,6 +217,10 @@ module hydro
 		enddo
 	end subroutine tridi
 	
+	!This subroutine calculates the values of 
+	subroutine eval_rhs
+	end subroutine eval_rhs
+	
 	!Calculates all the values for the next time step from the current values
 	subroutine evolve_step
 	
@@ -239,6 +250,15 @@ module hydro
 				dpsi_dz(k,:) = (psi(k+1,:) - psi(k-1,:))/(2*dz)
 			end do
 			!$OMP END PARALLEL DO
+			
+			!Add in the n=0 piece of the nonlinear term:
+			!$OMP PARALLEL DO
+			do i=1,nz_horizontal
+				nonlinear_temp(2:nz_vertical-1,0) = nonlinear_temp(2:nz_vertical-1,0) - &
+					pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i) + &
+					i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i))
+			end do
+			!$OMP END PARALLEL DO
 		endif
 		
 		!Second step is to calculate the time derivatives of omega and temp. These come
@@ -255,62 +275,90 @@ module hydro
 			domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
 				prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
 			if(.not.do_linear) then
-				!Add in the nonlinear terms using a Galerkin method:
+				!Add in the nonlinear terms using a Galerkin method (figure out which modes i
+				!contribute to the mode n being considered in the outer loop)
 				do i=1,nz_horizontal
 					!i+j = n:	(can combine this term with the next using abs(n-i))
 					if((1.le.(n-i)).and.((n-i).le.nz_horizontal)) then
-						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) + &
-							pi/(2*a)*(i*psi(2:nz_vertical-1,i)*domega_dz(2:nz_vertical-1,n-i) - &
-							(n-i)*dpsi_dz(2:nz_vertical-1,i)*omega(2:nz_vertical-1,n-i))
-						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) + &
-							pi/(2*a)*(-(n-i)*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,n-i) + &
-							i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,n-i))
+						!write(*,*) 'Entering 1 < (n-i) < nz_horizontal branch:', (n-i)
+						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
+							pi/(2*a)*((n-i)*psi(2:nz_vertical-1,n-i)*domega_dz(2:nz_vertical-1,i) - &
+							i*dpsi_dz(2:nz_vertical-1,n-i)*omega(2:nz_vertical-1,i))
+						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+							pi/(2*a)*(-i*dpsi_dz(2:nz_vertical-1,n-i)*temp(2:nz_vertical-1,i) + &
+							(n-i)*psi(2:nz_vertical-1,n-i)*dtemp_dz(2:nz_vertical-1,i))
+						!write(*,*) nonlinear_temp(nz_vertical/3, n), nonlinear_omega(nz_vertical/3, n)
 					endif
 					!i+j = n:
-					if((1.le.(i-n)).and.((i-n).le.nz_horizontal)) then
-						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) + &
-							pi/(2*a)*(i*psi(2:nz_vertical-1,i)*domega_dz(2:nz_vertical-1,i-n) - &
-							(i-n)*dpsi_dz(2:nz_vertical-1,i)*omega(2:nz_vertical-1,i-n))
-						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) + &
-							pi/(2*a)*(-(i-n)*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i-n) + &
-							i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i-n))
-					endif
+					!if((1.le.(i-n)).and.((i-n).le.nz_horizontal)) then
+					!	nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
+					!		pi/(2*a)*(i*psi(2:nz_vertical-1,i)*domega_dz(2:nz_vertical-1,i-n) - &
+					!		(i-n)*dpsi_dz(2:nz_vertical-1,i)*omega(2:nz_vertical-1,i-n))
+					!	nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+					!		pi/(2*a)*(-(i-n)*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i-n) + &
+					!		i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i-n))
+					!endif
 					!i-j = n:
 					if((1.le.(i-n)).and.((i-n).le.nz_horizontal)) then
+						!write(*,*) 'Entering 1 < (i-n) < nz_horizontal branch:', (i-n)
 						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
-							pi/(2*a)*(i*psi(2:nz_vertical-1,i)*domega_dz(2:nz_vertical-1,i-n) + &
-							(i-n)*dpsi_dz(2:nz_vertical-1,i)*omega(2:nz_vertical-1,i-n))
-						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) + &
-							pi/(2*a)*((i-n)*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i-n) + &
-							i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i-n))
+							pi/(2*a)*((i-n)*psi(2:nz_vertical-1,i-n)*domega_dz(2:nz_vertical-1,i) + &
+							i*dpsi_dz(2:nz_vertical-1,i-n)*omega(2:nz_vertical-1,i))
+						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i-n)*temp(2:nz_vertical-1,i) + &
+							(i-n)*psi(2:nz_vertical-1,i-n)*dtemp_dz(2:nz_vertical-1,i))
 					endif
 					!j-i = n:
 					if((1.le.(i+n)).and.((i+n).le.nz_horizontal)) then
+						!write(*,*) 'Entering 1 < (i+n) < nz_horizontal branch:', (i+n)
 						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) + & 
-							pi/(2*a)*(i*psi(2:nz_vertical-1,i)*domega_dz(2:nz_vertical-1,n+i) + &
-							(n+i)*dpsi_dz(2:nz_vertical-1,i)*omega(2:nz_vertical-1,n+i))
-						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) + &
-							pi/(2*a)*((i+n)*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i+n) + &
-							i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i+n))
+							pi/(2*a)*((i+n)*psi(2:nz_vertical-1,i+n)*domega_dz(2:nz_vertical-1,i) + &
+							i*dpsi_dz(2:nz_vertical-1,i+n)*omega(2:nz_vertical-1,i))
+						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i+n)*temp(2:nz_vertical-1,i) + &
+							(i+n)*psi(2:nz_vertical-1,i+n)*dtemp_dz(2:nz_vertical-1,i))
 					endif
+					
+					!read(*,*)
 				end do
+				
+				!lastly, the i=n term:
+				!write(*,*) 'Adding on the n=i'
+				nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+					(n*pi/a)*dtemp_dz(2:nz_vertical-1,0)*psi(2:nz_vertical-1,n)
+					
 				!Now that the nonlinear terms are computed, add them to the time derivatives:
 				dtemp_dt(2:nz_vertical-1,n,2) = dtemp_dt(2:nz_vertical-1,n,2) + &
 					nonlinear_temp(2:nz_vertical-1,n)
 				domega_dt(2:nz_vertical-1,n,2) = domega_dt(2:nz_vertical-1,n,2) + &
 					nonlinear_omega(2:nz_vertical-1,n)
+				if(dbg) then
+					write(*,*) 'Final nonlinear terms:'
+					write(*,*) n, nonlinear_temp(nz_vertical/3,n), nonlinear_omega(nz_vertical/3,n)
+				endif
 			endif
 		end do
 		!$OMP END PARALLEL DO
+		!Finally, add in the n=0 term contributions (only non-zero one is for temperature):
+		dtemp_dt(2:nz_vertical-1,0,2) = dtemp_dz2(2:nz_vertical-1,0) + nonlinear_temp(2:nz_vertical-1,0)
 		
 		!Keep the old value of temp to examine the growth rate
 		prev_temp(:,:) = temp(:,:)
 		
 		!Next, we use the current time derivatives along with those from the previous
 		!step to calculate the fluid quantities at the next time step.
-		!Here, we're using the Adams-Bashforth scheme (explicit):
-		temp(:,:) = temp(:,:) + dt/2d0*(3*dtemp_dt(:,:,2) -  dtemp_dt(:,:,1))
-		omega(:,:) = omega(:,:) + dt/2d0*(3*domega_dt(:,:,2) -  domega_dt(:,:,1))
+		
+		!For the first step, we only have initial condition information so can't go back the
+		!required two steps in the Adams-Bashforth scheme. Instead, the first step will be computed
+		!using a 2nd order Runge-Kutta solver:
+		!if(nstep.eq.1) then
+		!	temp(:,:) = temp(:,:) + dt*
+		!else
+			!Here, we're using the Adams-Bashforth scheme (explicit):
+			temp(:,:) = temp(:,:) + dt/2d0*(3*dtemp_dt(:,:,2) -  dtemp_dt(:,:,1))
+			omega(:,:) = omega(:,:) + dt/2d0*(3*domega_dt(:,:,2) -  domega_dt(:,:,1))
+		!endif
+		
 		temp_display(:,:) = 0d0
 		omega_display(:,:) = 0d0
 		!$OMP PARALLEL DO
@@ -356,7 +404,7 @@ module hydro
 		!write(*,'(a25,99ES25.10)') 'dtemp_dt(nz/3,:,1):', dtemp_dt(nz_vertical/3,:,1)
 		!write(*,'(a25,99ES25.10)') 'domega_dt(nz/3,:,1):', domega_dt(nz_vertical/3,:,1)
 		
-		write(*,'(a25)') 'temp growth(nz/3,:):'
+		write(*,'(a40)') 'non-zero mode temp growth(nz/3,:):'
 		do i=0,nz_horizontal
 			if((temp(nz_vertical/3,i).ne.0d0).and.(prev_temp(nz_vertical/3,i).ne.0d0)) then
 				write(*,'(a17,i2,a3,ES25.10)') 'temp growth(nz/3,',i,'):', &
@@ -385,8 +433,8 @@ module hydro
 		j1 = 1
 		j2 = nz_vertical
 		!
-		a1 = -5e1
-		a2 = 5e1
+		a1 = -1e1
+		a2 = 1e1
 		
 		!Possible transformation matrix for rotated coordinate system:
 		pgplot_theta = 0d0
@@ -408,7 +456,7 @@ module hydro
 		
 		!call pgimag (real(temp_display), nz_vertical, nz_horizontal, i1, i2, j1, j2, a1, a2, tr)
 		!call pgpage()
-		call pgimag (real(omega_display), nz_vertical, nz_vertical, i1, i2, j1, j2, a1, a2, tr)
+		call pgimag (real(temp_display), nz_vertical, nz_vertical, i1, i2, j1, j2, a1, a2, tr)
 	end subroutine plot_vals
 	
 	subroutine shutdown
@@ -434,7 +482,8 @@ program main
 		write(*,*) 'Evolving step',i
 		call evolve_step()
 		if(use_pgplot) call plot_vals()
-		!call output_vals()
+		call output_vals()
+		if(dbg) read(*,*)
 	end do
 	
 	call shutdown()
