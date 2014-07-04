@@ -25,8 +25,8 @@ module hydro
 	double precision, parameter :: fixed_dt = 3d-6	!If >0, then use this as the fixed dt value
 	!Number of old time steps to keep track of when time-stepping:
 	integer, parameter :: num_time_differences = 2
-	integer, parameter :: num_steps = 100000		!Number of time steps to take
-	character (len=16) :: solver	!'RK2' or 'AB2' for now
+	integer, parameter :: num_steps = 300000		!Number of time steps to take
+	character (len=16) :: solver	!'RK2' or 'AB2' for now (not implemented yet)
 	
 	!Physical parameters:
 	double precision, parameter :: rayleigh = 1d6	!Rayleigh number (dimensionless)
@@ -123,12 +123,13 @@ module hydro
 		domega_dz2(:,:) = 0d0
 		do k=1,nz_vertical
 			z(k) = (k - 1)*dz
-			!Satisfies the boundary conditions:
+			
+			!Pick a temperature that satisfies the boundary conditions:
 			temp(k,0) = 1d0 - z(k)
 			!temp(k,1) = 0.01*sin(pi*z(k))
-			temp(k,2) = 0.01*sin(pi*z(k))
+			temp(k,1) = 0.01*sin(pi*z(k))
 			temp(k,8) = 0.01*sin(pi*z(k))
-			!temp(k,1:nz_horizontal) = sin(pi*z(k))
+			!temp(k,1:nz_horizontal) = sin(pi*z(k))	!Works for all spatial rows
 		end do
 		do k=1,nz_vertical
 			do n=1,nz_horizontal
@@ -217,7 +218,8 @@ module hydro
 		enddo
 	end subroutine tridi
 	
-	!This subroutine calculates the values of 
+	!This subroutine calculates the values of the time derivaties of temp & omega, used in
+	!generalizing the timestepping. 
 	subroutine eval_rhs
 	end subroutine eval_rhs
 	
@@ -225,6 +227,10 @@ module hydro
 	subroutine evolve_step
 	
 		integer :: k,n,i	!Loop indicies
+		
+		!Initialize the derivatives we compute in this subroutine:
+		dtemp_dt(:,:,2) = 0d0
+		domega_dt(:,:,2) = 0d0
 	
 		!First step is to calculate the necessary z-derivatives of variables using the
 		!finite difference method:
@@ -267,14 +273,22 @@ module hydro
 		!Add in the nonlinear terms using a Galerkin method (if necessary):
 		!First is the n=0 term for the cosine series of [(v*del)T]_n:
 		!Which n,m values do we want? Those where n-m = 0	
+		!First, the n=0 terms:
+		dtemp_dt(2:nz_vertical-1,0,2) = dtemp_dz2(2:nz_vertical-1,0)
+		!domega_dt(2:nz_vertical-1,0,2) = prandtl*domega_dz2(2:nz_vertical-1,0) !No n=0 term for omega
 		!$OMP PARALLEL DO
 		do n=1,nz_horizontal
 			!Always need to compute the linear terms:
-			dtemp_dt(2:nz_vertical-1,n,2) = (n*pi/a)*psi(2:nz_vertical-1,n) + &
-				(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
-			domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
-				prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
-			if(.not.do_linear) then
+			if(do_linear) then
+				dtemp_dt(2:nz_vertical-1,n,2) = (n*pi/a)*psi(2:nz_vertical-1,n) + &
+					(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
+				domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
+					prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
+			else
+				dtemp_dt(2:nz_vertical-1,n,2) = &	!Remove the linear approximation to the advection term
+					(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
+				domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
+					prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
 				!Add in the nonlinear terms using a Galerkin method (figure out which modes i
 				!contribute to the mode n being considered in the outer loop)
 				do i=1,nz_horizontal
@@ -322,16 +336,15 @@ module hydro
 					!read(*,*)
 				end do
 				
-				!lastly, the i=n term:
-				!write(*,*) 'Adding on the n=i'
+				!lastly, the term outside the double sum (only depends on n):
 				nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
 					(n*pi/a)*dtemp_dz(2:nz_vertical-1,0)*psi(2:nz_vertical-1,n)
 					
 				!Now that the nonlinear terms are computed, add them to the time derivatives:
-				dtemp_dt(2:nz_vertical-1,n,2) = dtemp_dt(2:nz_vertical-1,n,2) + &
-					nonlinear_temp(2:nz_vertical-1,n)
-				domega_dt(2:nz_vertical-1,n,2) = domega_dt(2:nz_vertical-1,n,2) + &
-					nonlinear_omega(2:nz_vertical-1,n)
+				!dtemp_dt(2:nz_vertical-1,n,2) = dtemp_dt(2:nz_vertical-1,n,2) + &
+				!	nonlinear_temp(2:nz_vertical-1,n)
+				!domega_dt(2:nz_vertical-1,n,2) = domega_dt(2:nz_vertical-1,n,2) + &
+				!	nonlinear_omega(2:nz_vertical-1,n)
 				if(dbg) then
 					write(*,*) 'Final nonlinear terms:'
 					write(*,*) n, nonlinear_temp(nz_vertical/3,n), nonlinear_omega(nz_vertical/3,n)
@@ -340,7 +353,11 @@ module hydro
 		end do
 		!$OMP END PARALLEL DO
 		!Finally, add in the n=0 term contributions (only non-zero one is for temperature):
-		dtemp_dt(2:nz_vertical-1,0,2) = dtemp_dz2(2:nz_vertical-1,0) + nonlinear_temp(2:nz_vertical-1,0)
+		dtemp_dt(2:nz_vertical-1,:,2) = dtemp_dt(2:nz_vertical-1,:,2) + &
+			nonlinear_temp(2:nz_vertical-1,:)
+		domega_dt(2:nz_vertical-1,:,2) = domega_dt(2:nz_vertical-1,:,2) + &
+			nonlinear_omega(2:nz_vertical-1,:)
+		!dtemp_dt(2:nz_vertical-1,0,2) = dtemp_dz2(2:nz_vertical-1,0) + nonlinear_temp(2:nz_vertical-1,0)
 		
 		!Keep the old value of temp to examine the growth rate
 		prev_temp(:,:) = temp(:,:)
@@ -358,6 +375,20 @@ module hydro
 			temp(:,:) = temp(:,:) + dt/2d0*(3*dtemp_dt(:,:,2) -  dtemp_dt(:,:,1))
 			omega(:,:) = omega(:,:) + dt/2d0*(3*domega_dt(:,:,2) -  domega_dt(:,:,1))
 		!endif
+		
+		!Check for NaN values:
+		do k=1,nz_vertical
+			do n=0,nz_horizontal
+				if (isnan(temp(k,n))) then
+					write(*,*) '"temp" is a NaN', k, n
+					stop 20
+				endif
+				if (isnan(omega(k,n))) then
+					write(*,*) '"omega" is a NaN', k, n
+					stop 20
+				endif
+			end do
+		end do
 		
 		temp_display(:,:) = 0d0
 		omega_display(:,:) = 0d0
@@ -414,6 +445,9 @@ module hydro
 			!	abs(log(temp(nz_vertical/3,i)) - log(prev_temp(nz_vertical/3,i)))
 		end do
 		write(*,*)
+		do i=0,nz_horizontal
+			write(*,'(a17,i2,a3,ES25.10)') 'temp(nz/3,',i,'):', temp(nz_vertical/3,i)
+		end do
 		
 		write(*,*)
 	end subroutine output_vals
@@ -433,8 +467,8 @@ module hydro
 		j1 = 1
 		j2 = nz_vertical
 		!
-		a1 = -1e1
-		a2 = 1e1
+		a1 = -0.5e1
+		a2 = 0.5e1
 		
 		!Possible transformation matrix for rotated coordinate system:
 		pgplot_theta = 0d0
@@ -459,12 +493,15 @@ module hydro
 		call pgimag (real(temp_display), nz_vertical, nz_vertical, i1, i2, j1, j2, a1, a2, tr)
 	end subroutine plot_vals
 	
+	!Deallocates and cleans up all data, file IO streams, etc.
 	subroutine shutdown
 		call pgclos()
 	end subroutine shutdown
 
 end module hydro
 
+
+!Main driver program that loops through time steps
 program main
 
 	use hydro
