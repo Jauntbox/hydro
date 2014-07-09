@@ -64,7 +64,7 @@ module hydro
 		write(*,*) 'Initializing hydro module!'
 		write(*,*)
 		
-		!Make sure we satisfy the CFL limit:
+		!Make sure we satisfy the numerical diffusion limit:
 		if(prandtl.lt.1d0) then
 			dt = (dz**2)/4d0
 		else
@@ -126,7 +126,6 @@ module hydro
 			
 			!Pick a temperature that satisfies the boundary conditions:
 			temp(k,0) = 1d0 - z(k)
-			!temp(k,1) = 0.01*sin(pi*z(k))
 			temp(k,1) = 0.01*sin(pi*z(k))
 			temp(k,8) = 0.01*sin(pi*z(k))
 			!temp(k,1:nz_horizontal) = sin(pi*z(k))	!Works for all spatial rows
@@ -176,7 +175,7 @@ module hydro
 		  YR(I) = XR(I)**2
 		10 CONTINUE
 		CALL PGLINE(60,XR,YR)
-		CALL PGEND
+		CALL PGEND()
 	end subroutine pgplot_test
 	
 	!Generates the tridiagonal matrix used in the Poisson solve to obtain psi (the
@@ -254,6 +253,11 @@ module hydro
 				dtemp_dz(k,:) = (temp(k+1,:) - temp(k-1,:))/(2*dz)
 				domega_dz(k,:) = (omega(k+1,:) - omega(k-1,:))/(2*dz)
 				dpsi_dz(k,:) = (psi(k+1,:) - psi(k-1,:))/(2*dz)
+				do i=1,nz_horizontal
+					nonlinear_temp(k,0) = nonlinear_temp(k,0) - &
+						pi/(2*a)*(i*dpsi_dz(k,i)*temp(k,i) + &
+						i*psi(k,i)*dtemp_dz(k,i))
+				end do
 			end do
 			!$OMP END PARALLEL DO
 			
@@ -292,7 +296,7 @@ module hydro
 				!Add in the nonlinear terms using a Galerkin method (figure out which modes i
 				!contribute to the mode n being considered in the outer loop)
 				do i=1,nz_horizontal
-					!i+j = n:	(can combine this term with the next using abs(n-i))
+					!i+j = nn:
 					if((1.le.(n-i)).and.((n-i).le.nz_horizontal)) then
 						!write(*,*) 'Entering 1 < (n-i) < nz_horizontal branch:', (n-i)
 						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
@@ -303,16 +307,7 @@ module hydro
 							(n-i)*psi(2:nz_vertical-1,n-i)*dtemp_dz(2:nz_vertical-1,i))
 						!write(*,*) nonlinear_temp(nz_vertical/3, n), nonlinear_omega(nz_vertical/3, n)
 					endif
-					!i+j = n:
-					!if((1.le.(i-n)).and.((i-n).le.nz_horizontal)) then
-					!	nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
-					!		pi/(2*a)*(i*psi(2:nz_vertical-1,i)*domega_dz(2:nz_vertical-1,i-n) - &
-					!		(i-n)*dpsi_dz(2:nz_vertical-1,i)*omega(2:nz_vertical-1,i-n))
-					!	nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
-					!		pi/(2*a)*(-(i-n)*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i-n) + &
-					!		i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i-n))
-					!endif
-					!i-j = n:
+					!i-j = nn:
 					if((1.le.(i-n)).and.((i-n).le.nz_horizontal)) then
 						!write(*,*) 'Entering 1 < (i-n) < nz_horizontal branch:', (i-n)
 						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
@@ -322,7 +317,7 @@ module hydro
 							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i-n)*temp(2:nz_vertical-1,i) + &
 							(i-n)*psi(2:nz_vertical-1,i-n)*dtemp_dz(2:nz_vertical-1,i))
 					endif
-					!j-i = n:
+					!j-i = nn:
 					if((1.le.(i+n)).and.((i+n).le.nz_horizontal)) then
 						!write(*,*) 'Entering 1 < (i+n) < nz_horizontal branch:', (i+n)
 						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) + & 
@@ -336,7 +331,7 @@ module hydro
 					!read(*,*)
 				end do
 				
-				!lastly, the term outside the double sum (only depends on n):
+				!lastly, the term outside the double sum with dT0/dz (only depends on n):
 				nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
 					(n*pi/a)*dtemp_dz(2:nz_vertical-1,0)*psi(2:nz_vertical-1,n)
 					
@@ -352,12 +347,12 @@ module hydro
 			endif
 		end do
 		!$OMP END PARALLEL DO
-		!Finally, add in the n=0 term contributions (only non-zero one is for temperature):
+
+		!Add in all the nonlinear terms (only nonzero if do_linear = .false.)
 		dtemp_dt(2:nz_vertical-1,:,2) = dtemp_dt(2:nz_vertical-1,:,2) + &
 			nonlinear_temp(2:nz_vertical-1,:)
 		domega_dt(2:nz_vertical-1,:,2) = domega_dt(2:nz_vertical-1,:,2) + &
 			nonlinear_omega(2:nz_vertical-1,:)
-		!dtemp_dt(2:nz_vertical-1,0,2) = dtemp_dz2(2:nz_vertical-1,0) + nonlinear_temp(2:nz_vertical-1,0)
 		
 		!Keep the old value of temp to examine the growth rate
 		prev_temp(:,:) = temp(:,:)
@@ -367,7 +362,7 @@ module hydro
 		
 		!For the first step, we only have initial condition information so can't go back the
 		!required two steps in the Adams-Bashforth scheme. Instead, the first step will be computed
-		!using a 2nd order Runge-Kutta solver:
+		!using a 2nd order Runge-Kutta solver (to be implemented)
 		!if(nstep.eq.1) then
 		!	temp(:,:) = temp(:,:) + dt*
 		!else
@@ -377,18 +372,20 @@ module hydro
 		!endif
 		
 		!Check for NaN values:
-		do k=1,nz_vertical
-			do n=0,nz_horizontal
-				if (isnan(temp(k,n))) then
-					write(*,*) '"temp" is a NaN', k, n
-					stop 20
-				endif
-				if (isnan(omega(k,n))) then
-					write(*,*) '"omega" is a NaN', k, n
-					stop 20
-				endif
-			end do
-		end do
+		! !$OMP PARALLEL DO
+		!do k=1,nz_vertical
+		!	do n=0,nz_horizontal
+		!		if (isnan(temp(k,n))) then
+		!			write(*,*) '"temp" is a NaN', k, n
+		!			stop 20
+		!		endif
+		!		if (isnan(omega(k,n))) then
+		!			write(*,*) '"omega" is a NaN', k, n
+		!			stop 20
+		!		endif
+		!	end do
+		!end do
+		! !$OMP END PARALLEL DO
 		
 		temp_display(:,:) = 0d0
 		omega_display(:,:) = 0d0
@@ -519,7 +516,7 @@ program main
 		write(*,*) 'Evolving step',i
 		call evolve_step()
 		if(use_pgplot) call plot_vals()
-		call output_vals()
+		!call output_vals()
 		if(dbg) read(*,*)
 	end do
 	

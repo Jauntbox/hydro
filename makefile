@@ -8,6 +8,7 @@ FCfree = -ffree-form $(FC_free_preprocess)
 FCopenmp = -fopenmp
 
 LOAD_LAPACK = -L/Users/Kevin/Downloads/lapack-3.5.0 -llapack -lblas
+LOAD_FFTW = -lfftw3
 LOAD_PGPLOT = -L$(PGPLOT_DIR) -lpgplot
 LOAD_OTHER = 
 
@@ -26,7 +27,7 @@ PROG_OBJS = test_hydro.o
 PROG_DIR = .
 
 $(PROG) : $(PROG_OBJS)
-	$(FC) $(FCbasic) $(FCopenmp) -o$(PROG_DIR)/$(PROG) $(PROG_OBJS) $(LOAD_LAPACK) $(LOAD_PGPLOT) $(LOAD_OTHER)
+	$(FC) $(FCbasic) $(FCopenmp) -o$(PROG_DIR)/$(PROG) $(PROG_OBJS) $(LOAD_LAPACK) $(LOAD_FFTW) $(LOAD_PGPLOT) $(LOAD_OTHER)
 
 #################################################################
 
