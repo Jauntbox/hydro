@@ -15,18 +15,23 @@ module hydro
 	logical, parameter :: dbg = .false.		!If true, print debugging output to the screen
 	
 	!Domain size parameters
-	integer, parameter :: nz_vertical = 101		!Number of vertical zones in simulation
+	integer, parameter :: nz_vertical = 101	    !Number of vertical zones in simulation
 	integer, parameter :: nz_horizontal = 50	!Number of Fourier modes in the horizontal
 	double precision, parameter :: dz = 1d0/(nz_vertical-1)	!spacing in the z-direction
 	double precision, parameter :: a = 3.0	!horizontal/vertical length scale
 	
 	!Timestep parameters:
 	double precision :: dt	!Gets set in initialize()
-	double precision, parameter :: fixed_dt = 3d-6	!If >0, then use this as the fixed dt value
+    double precision :: dt_old  !For recalculating coefficients in Adams-Bashforth
+	double precision, parameter :: fixed_dt = 3e-6	!If >0, then use this as the fixed dt value
 	!Number of old time steps to keep track of when time-stepping:
 	integer, parameter :: num_time_differences = 2
-	integer, parameter :: num_steps = 300000		!Number of time steps to take
+	integer, parameter :: num_steps = 1000000		!Number of time steps to take
 	character (len=16) :: solver	!'RK2' or 'AB2' for now (not implemented yet)
+    integer, parameter :: output_tick = 1000 !Print screen output every output_tick time steps
+    integer, parameter :: cfl_tick = 10 !Check the CFL condition every cfl_tick time steps
+    double precision :: avg_cfl_x, avg_cfl_z    !Avg CFL RHS values (to guess at increasing timestep)
+    
 	
 	!Physical parameters:
 	double precision, parameter :: rayleigh = 1d6	!Rayleigh number (dimensionless)
@@ -36,7 +41,7 @@ module hydro
 	double precision, parameter :: pi = 4d0*atan(1d0)
 	
 	!Fluid variables:
-	double precision, dimension(1:nz_vertical) :: u_x, u_z, z, sub, dia, sup, wk1, wk2
+	double precision, dimension(1:nz_vertical) :: z, sub, dia, sup, wk1, wk2
 	double precision, dimension(1:nz_vertical, 0:nz_horizontal) :: psi, omega, temp, prev_temp
 	!Nonlinear terms: [(v*del)variable]
 	double precision, dimension(1:nz_vertical, 0:nz_horizontal) :: nonlinear_temp, nonlinear_omega
@@ -45,11 +50,13 @@ module hydro
 		dtemp_dz, dpsi_dz, domega_dz
 	double precision, dimension(1:nz_vertical, 0:nz_horizontal, 1:num_time_differences) :: &
 		domega_dt, dtemp_dt
+    double precision, dimension(1:nz_vertical, 1:nz_vertical) :: u_x, u_z
 		
 	!PGPLOT variables:
 	integer :: pgplot_id		!PGPLOT handle
 	character (len=16) :: dev	!PGPLOT device name (eg. '/xwin')
 	double precision, dimension(1:nz_vertical, 0:nz_vertical) :: temp_display, omega_display
+    integer, parameter :: plot_tick = 20    !Update the plot window every plot_tick timesteps
 	
 	contains
 	
@@ -74,6 +81,7 @@ module hydro
 		dt = 0.8*dt
 		
 		if(fixed_dt > 0) dt = fixed_dt 
+        dt_old = dt
 		
 		write(*,*) 'Domain size parameters:'
 		write(*,'(a25,I25)') 'nz_horizontal:', nz_horizontal
@@ -127,7 +135,7 @@ module hydro
 			!Pick a temperature that satisfies the boundary conditions:
 			temp(k,0) = 1d0 - z(k)
 			temp(k,1) = 0.01*sin(pi*z(k))
-			temp(k,8) = 0.01*sin(pi*z(k))
+			temp(k,8) = 0.015*sin(pi*z(k))
 			!temp(k,1:nz_horizontal) = sin(pi*z(k))	!Works for all spatial rows
 		end do
 		do k=1,nz_vertical
@@ -142,6 +150,9 @@ module hydro
 		sub(nz_vertical) = 0d0
 		sup(1) = 0d0
 		dia(:) = 1d0	!Only for the boundary conditions 2:nz_vertical-1 will be overwritten
+        
+        avg_cfl_x = 0d0
+        avg_cfl_z = 0d0
 		
 		!Start up PGPLOT window:
 		if(use_pgplot) then
@@ -262,13 +273,18 @@ module hydro
 			!$OMP END PARALLEL DO
 			
 			!Add in the n=0 piece of the nonlinear term:
-			!$OMP PARALLEL DO
-			do i=1,nz_horizontal
-				nonlinear_temp(2:nz_vertical-1,0) = nonlinear_temp(2:nz_vertical-1,0) - &
-					pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i) + &
-					i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i))
-			end do
-			!$OMP END PARALLEL DO
+            !(removed 7/21/14 beause of double counting in loop above) - now things are breaking around
+            !step 27,200 for the Ch.4 benchmark for initializing n=1 and n=8 modes for nz_horizontal = 50
+            !and breaks around step 7000 for nz_horizontal = 20,
+            !nz_horizontal = 10 went strong for at least 235,000 steps (still going)
+            
+		!	!$OMP PARALLEL DO
+			!do i=1,nz_horizontal
+			!	nonlinear_temp(2:nz_vertical-1,0) = nonlinear_temp(2:nz_vertical-1,0) - &
+			!		pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i) + &
+			!		i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i))
+			!end do
+		!	!$OMP END PARALLEL DO
 		endif
 		
 		!Second step is to calculate the time derivatives of omega and temp. These come
@@ -280,6 +296,7 @@ module hydro
 		!First, the n=0 terms:
 		dtemp_dt(2:nz_vertical-1,0,2) = dtemp_dz2(2:nz_vertical-1,0)
 		!domega_dt(2:nz_vertical-1,0,2) = prandtl*domega_dz2(2:nz_vertical-1,0) !No n=0 term for omega
+        
 		!$OMP PARALLEL DO
 		do n=1,nz_horizontal
 			!Always need to compute the linear terms:
@@ -305,7 +322,6 @@ module hydro
 						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
 							pi/(2*a)*(-i*dpsi_dz(2:nz_vertical-1,n-i)*temp(2:nz_vertical-1,i) + &
 							(n-i)*psi(2:nz_vertical-1,n-i)*dtemp_dz(2:nz_vertical-1,i))
-						!write(*,*) nonlinear_temp(nz_vertical/3, n), nonlinear_omega(nz_vertical/3, n)
 					endif
 					!i-j = nn:
 					if((1.le.(i-n)).and.((i-n).le.nz_horizontal)) then
@@ -316,6 +332,7 @@ module hydro
 						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
 							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i-n)*temp(2:nz_vertical-1,i) + &
 							(i-n)*psi(2:nz_vertical-1,i-n)*dtemp_dz(2:nz_vertical-1,i))
+                        !write(*,*) nonlinear_temp(3, n)
 					endif
 					!j-i = nn:
 					if((1.le.(i+n)).and.((i+n).le.nz_horizontal)) then
@@ -326,6 +343,7 @@ module hydro
 						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
 							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i+n)*temp(2:nz_vertical-1,i) + &
 							(i+n)*psi(2:nz_vertical-1,i+n)*dtemp_dz(2:nz_vertical-1,i))
+                        !write(*,*) nonlinear_temp(3, n)
 					endif
 					
 					!read(*,*)
@@ -344,7 +362,8 @@ module hydro
 					write(*,*) 'Final nonlinear terms:'
 					write(*,*) n, nonlinear_temp(nz_vertical/3,n), nonlinear_omega(nz_vertical/3,n)
 				endif
-			endif
+                
+			endif !do_linear
 		end do
 		!$OMP END PARALLEL DO
 
@@ -367,8 +386,12 @@ module hydro
 		!	temp(:,:) = temp(:,:) + dt*
 		!else
 			!Here, we're using the Adams-Bashforth scheme (explicit):
-			temp(:,:) = temp(:,:) + dt/2d0*(3*dtemp_dt(:,:,2) -  dtemp_dt(:,:,1))
-			omega(:,:) = omega(:,:) + dt/2d0*(3*domega_dt(:,:,2) -  domega_dt(:,:,1))
+			!temp(:,:) = temp(:,:) + dt/2d0*(3*dtemp_dt(:,:,2) -  dtemp_dt(:,:,1))
+			!omega(:,:) = omega(:,:) + dt/2d0*(3*domega_dt(:,:,2) -  domega_dt(:,:,1))
+			temp(:,:) = temp(:,:) + dt*((1d0 + dt/(2*dt_old))*dtemp_dt(:,:,2) -  &
+                (dt/(2*dt_old))*dtemp_dt(:,:,1))
+			omega(:,:) = omega(:,:) + dt*((1d0 + dt/(2*dt_old))*domega_dt(:,:,2) -  &
+                (dt/(2*dt_old))*domega_dt(:,:,1))
 		!endif
 		
 		!Check for NaN values:
@@ -387,17 +410,6 @@ module hydro
 		!end do
 		! !$OMP END PARALLEL DO
 		
-		temp_display(:,:) = 0d0
-		omega_display(:,:) = 0d0
-		!$OMP PARALLEL DO
-		do k=1,nz_vertical
-			do n=0,nz_horizontal
-				temp_display(:,k) = temp_display(:,k) + temp(:,n)*cos(n*pi*dz*k)
-				omega_display(:,k) = omega_display(:,k) + omega(:,n)*sin(n*pi*dz*k)
-			end do
-		end do
-		!$OMP END PARALLEL DO
-		
 		!Then find the streamfunction psi by doing a Poisson solve with our tridiagonal
 		!matrix routine.
 		!$OMP PARALLEL DO
@@ -412,6 +424,65 @@ module hydro
 		domega_dt(:,:,1) = domega_dt(:,:,2)
 		
 	end subroutine evolve_step
+    
+    !Checks the CFL condition (||
+    !u_x = -dpsi_dz, u_z = dpsi_dx
+    subroutine check_cfl(step_num)
+        
+        integer, intent(in) :: step_num
+        integer :: k,n
+        double precision :: cfl_x, cfl_z
+        !Reduce timestep if the CFL limit gets within cfl_timestep_limit_factor*dt (cfl_timestep_limit_factor > 1)
+        double precision :: cfl_timestep_limit_factor
+        !If reducing timestep due to CFL condition, then make the new timestep dt*cfl_reduction_factor
+        double precision :: cfl_reduction_factor
+        
+        cfl_reduction_factor = 0.8
+        cfl_timestep_limit_factor = 1.2
+        
+        if(cfl_timestep_limit_factor.le.1.0) then
+            write(*,*) 'cfl_timestep_limit_factor must be > 1.0'
+            stop 1
+        endif
+        
+        u_x(:,:) = 0d0
+        u_z(:,:) = 0d0
+        dt_old = dt
+        
+        !Convert the horizontal Fourier modes into real space
+		do k=1,nz_vertical
+			do n=0,nz_horizontal
+				u_x(:,k) = u_x(:,k) - dpsi_dz(:,n)*sin(n*pi*dz*k)
+				u_z(:,k) = u_z(:,k) + (n*pi/a)*psi(:,n)*cos(n*pi*dz*k)
+			end do
+		end do
+        
+        cfl_x = (a/nz_horizontal)/maxval(abs(u_x))
+        cfl_z = dz/maxval(abs(u_z))
+        !write(*,*) 'max u_x, dx/u_x:', (a/nz_horizontal)/cfl_x, cfl_x
+        !write(*,*) 'max u_z, dz/u_z:', dz/cfl_z, cfl_z
+        !Compute running averages:
+        avg_cfl_x = (avg_cfl_x*(step_num/cfl_tick - 1) + cfl_x)/(step_num/cfl_tick)
+        avg_cfl_z = (avg_cfl_z*(step_num/cfl_tick - 1) + cfl_z)/(step_num/cfl_tick)
+        
+        !Reduce the timestep, if necessary:
+        if((a/nz_horizontal)/maxval(u_x).lt.dt*cfl_timestep_limit_factor) then
+            dt = dt*cfl_reduction_factor
+            write(*,*) 'Reducing timestep due to CFL condition (x-direction)', dt
+        endif
+        if(dz/maxval(u_z).lt.dt*cfl_timestep_limit_factor) then
+            dt = dt*cfl_reduction_factor
+            write(*,*) 'Reducing timestep due to CFL condition (z-direction)', dt
+        endif
+        
+        !Increase the timestep, if necessary:
+        !maybe try this later with a running average of the last ~1000 timesteps?
+        !if(((step_num > 10000).and.(avg_cfl_x > 2*dt*cfl_timestep_limit_factor)).and.&
+        !    (avg_cfl_z > 2*dt*cfl_timestep_limit_factor)) then
+        !    dt = dt/cfl_reduction_factor
+        !endif
+        
+    end subroutine check_cfl
 	
 	!Outputs selected fluid variables to the screen
 	subroutine output_vals
@@ -432,26 +503,40 @@ module hydro
 		!write(*,'(a25,99ES25.10)') 'dtemp_dt(nz/3,:,1):', dtemp_dt(nz_vertical/3,:,1)
 		!write(*,'(a25,99ES25.10)') 'domega_dt(nz/3,:,1):', domega_dt(nz_vertical/3,:,1)
 		
-		write(*,'(a40)') 'non-zero mode temp growth(nz/3,:):'
-		do i=0,nz_horizontal
-			if((temp(nz_vertical/3,i).ne.0d0).and.(prev_temp(nz_vertical/3,i).ne.0d0)) then
-				write(*,'(a17,i2,a3,ES25.10)') 'temp growth(nz/3,',i,'):', &
-					log(abs(temp(nz_vertical/3,i))) - log(abs(prev_temp(nz_vertical/3,i)))
-			endif
+		!write(*,'(a40)') 'non-zero mode temp growth(nz/3,:):'
+		!do i=0,nz_horizontal
+		!	if((temp(nz_vertical/3,i).ne.0d0).and.(prev_temp(nz_vertical/3,i).ne.0d0)) then
+		!		write(*,'(a17,i2,a3,ES25.10)') 'temp growth(nz/3,',i,'):', &
+		!			log(abs(temp(nz_vertical/3,i))) - log(abs(prev_temp(nz_vertical/3,i)))
+		!	endif
 			!write(*,'(ES25.10)',advance='no') 'temp growth(nz/3,:):', &
 			!	abs(log(temp(nz_vertical/3,i)) - log(prev_temp(nz_vertical/3,i)))
-		end do
-		write(*,*)
+            !end do
+		!write(*,*)
+        
+        write(*,'(a5,3a25)') 'n','temp','omega','psi'
 		do i=0,nz_horizontal
-			write(*,'(a17,i2,a3,ES25.10)') 'temp(nz/3,',i,'):', temp(nz_vertical/3,i)
+            write(*,'(i5,3ES25.10)') i, temp(nz_vertical/3,i), omega(nz_vertical/3,i), psi(nz_vertical/3,i)
+			!write(*,'(a17,i2,a3,ES25.10)') 'temp(nz/3,',i,'):', temp(nz_vertical/3,i)
+            !write(*,'(a17,i2,a3,ES25.10)') 'omega(nz/3,',i,'):', omega(nz_vertical/3,i)
+            !write(*,'(a17,i2,a3,ES25.10)') 'psi(nz/3,',i,'):', psi(nz_vertical/3,i)
 		end do
+        
+		!do i=0,nz_horizontal
+		!	write(*,'(a17,i2,a3,999ES25.10)') 'dtemp_dt(z(i),',i,'):', dtemp_dt(1:nz_vertical,i,2)
+        !    write(*,'(a17,i2,a3,999ES25.10)') 'domega_dt(z(i),',i,'):', domega_dt(1:nz_vertical,i,2)
+
+			!write(*,'(a17,i2,a3,99ES25.10)') 'temp(z(i),',i,'):', temp(1:nz_vertical,i)
+            !write(*,'(a17,i2,a3,99ES25.10)') 'omega(z(i),',i,'):', omega(1:nz_vertical,i)
+        !    write(*,'(a17,i2,a3,999ES25.10)') 'psi(z(i),',i,'):', psi(1:nz_vertical,i)
+        !end do
 		
 		write(*,*)
 	end subroutine output_vals
 	
 	!Calls a pgplot window to update with the new fluid quantities
 	subroutine plot_vals
-		integer :: i
+		integer :: k,n
 		integer :: i1,i2,j1,j2	!Array bounds for PGPLOT
 		real :: a1,a2	!Colormap bounds for the plotting
 		integer :: c1,c2,itf
@@ -464,8 +549,8 @@ module hydro
 		j1 = 1
 		j2 = nz_vertical
 		!
-		a1 = -0.5e1
-		a2 = 0.5e1
+		a1 = -0.1e1
+		a2 = 0.1e1
 		
 		!Possible transformation matrix for rotated coordinate system:
 		pgplot_theta = 0d0
@@ -484,6 +569,18 @@ module hydro
 		hg = (/0.0, 0.0, 0.5, 1.0, 1.0/) 
 		hb = (/0.0, 0.0, 0.0, 0.3, 1.0/)
 		call pgctab(hl, hr, hg, hb, 5, 1.0, 0.5)
+        
+        !Transform the horizontal components into real space
+		temp_display(:,:) = 0d0
+		omega_display(:,:) = 0d0
+		!$OMP PARALLEL DO
+		do k=1,nz_vertical
+			do n=0,nz_horizontal
+				temp_display(:,k) = temp_display(:,k) + temp(:,n)*cos(n*pi*dz*k)
+				omega_display(:,k) = omega_display(:,k) + omega(:,n)*sin(n*pi*dz*k)
+			end do
+		end do
+		!$OMP END PARALLEL DO
 		
 		!call pgimag (real(temp_display), nz_vertical, nz_horizontal, i1, i2, j1, j2, a1, a2, tr)
 		!call pgpage()
@@ -513,11 +610,26 @@ program main
 	if(use_pgplot) call plot_vals()
 	
 	do i=1,num_steps
-		write(*,*) 'Evolving step',i
 		call evolve_step()
-		if(use_pgplot) call plot_vals()
-		!call output_vals()
-		if(dbg) read(*,*)
+		if(use_pgplot.and.(mod(i,plot_tick).eq.2)) call plot_vals()
+        
+        !Remove timestep increaser for now, it seems to be breaking things
+        !if((mod(i,100000).eq.1).and.(fixed_dt.gt.0)) then
+        !    dt_old = dt
+        !    dt = fixed_dt    !Try to reset the timestep a bit larger every 50k timesteps (offset from CFL check to not interfere)
+        !endif
+        
+        if(mod(i,output_tick).eq.0) then
+            write(*,*) 'Evolving step',i
+            call output_vals()
+        endif
+        
+        if(mod(i,cfl_tick).eq.0) then
+            !write(*,*) 'Evolving step',i
+            call check_cfl(i)
+        endif
+        
+        if(dbg) read(*,*)
 	end do
 	
 	call shutdown()
