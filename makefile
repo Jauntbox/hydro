@@ -9,6 +9,7 @@ FCopenmp = -fopenmp
 
 LOAD_LAPACK = -L/Users/Kevin/Downloads/lapack-3.5.0 -llapack -lblas
 LOAD_FFTW = -lfftw3
+INCLUDE_FFTW = -I/Users/Kevin/Downloads/fftw-3.3.4/api
 LOAD_PGPLOT = -L$(PGPLOT_DIR) -lpgplot
 LOAD_OTHER = 
 
@@ -20,9 +21,13 @@ LOAD_OTHER =
 #PROG = test_tridiag
 #PROG_OBJS = test_tridiag.o
 
+#For compiling the FFTW tester:
+PROG = test_fftw
+PROG_OBJS = test_fftw.o
+
 #For compiling the 2D hydro code:
-PROG = test_hydro
-PROG_OBJS = test_hydro.o
+#PROG = test_hydro
+#PROG_OBJS = test_hydro.o
 
 PROG_DIR = .
 
@@ -35,4 +40,4 @@ MY_FC_FLAGS = $(FCfree)
 SRC_DIR = src
 
 %.o: $(SRC_DIR)/%.f
-	$(FC) $(FCbasic) $(FCopenmp) $(MY_FC_FLAGS) -c $<
+	$(FC) $(FCbasic) $(FCopenmp) $(MY_FC_FLAGS) $(INCLUDE_FFTW) -c $<
