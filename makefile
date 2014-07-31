@@ -22,12 +22,12 @@ LOAD_OTHER =
 #PROG_OBJS = test_tridiag.o
 
 #For compiling the FFTW tester:
-PROG = test_fftw
-PROG_OBJS = test_fftw.o
+#PROG = test_fftw
+#PROG_OBJS = test_fftw.o
 
 #For compiling the 2D hydro code:
-#PROG = test_hydro
-#PROG_OBJS = test_hydro.o
+PROG = test_hydro
+PROG_OBJS = test_hydro.o
 
 PROG_DIR = .
 

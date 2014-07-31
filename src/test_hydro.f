@@ -5,20 +5,30 @@
 !6/14/14
 
 module hydro
+    
+    use, intrinsic :: iso_c_binding
 
 	implicit none
+    
+    include 'fftw3.f03'
 	
 	!Overall simulation parameters:
 	!Only solve the linear problem (eg. equations )
 	logical, parameter :: do_linear = .false.
+    logical, parameter :: do_spectral_transform = .true.
 	logical, parameter :: use_pgplot = .true.
 	logical, parameter :: dbg = .false.		!If true, print debugging output to the screen
 	
 	!Domain size parameters
-	integer, parameter :: nz_vertical = 101	    !Number of vertical zones in simulation
-	integer, parameter :: nz_horizontal = 50	!Number of Fourier modes in the horizontal
+	integer, parameter :: nz_vertical = 101	    !Number of spatial vertical zones in simulation
+	integer, parameter :: nn_horizontal = 50	!Number of Fourier modes in the horizontal
+    !Number of spatial zones in horizontal (for spectral transform):
+    integer, parameter :: nz_horizontal = 4*nn_horizontal + 1
+    !Number of zones to use in the DFT in order to get odd modes (pi*n*x/L), rather than just the normal (2*pi*n*x/L) modes:
+    integer, parameter :: n_dft = 2*nz_horizontal
 	double precision, parameter :: dz = 1d0/(nz_vertical-1)	!spacing in the z-direction
-	double precision, parameter :: a = 3.0	!horizontal/vertical length scale
+    double precision, parameter :: dx = 1d0/(nz_horizontal)	!spacing in the x-direction
+	double precision, parameter :: a = 1.0	!horizontal/vertical length scale
 	
 	!Timestep parameters:
 	double precision :: dt	!Gets set in initialize()
@@ -42,15 +52,23 @@ module hydro
 	
 	!Fluid variables:
 	double precision, dimension(1:nz_vertical) :: z, sub, dia, sup, wk1, wk2
-	double precision, dimension(1:nz_vertical, 0:nz_horizontal) :: psi, omega, temp, prev_temp
+	double precision, dimension(1:nz_vertical, 0:nn_horizontal) :: psi, omega, temp, prev_temp
 	!Nonlinear terms: [(v*del)variable]
-	double precision, dimension(1:nz_vertical, 0:nz_horizontal) :: nonlinear_temp, nonlinear_omega
+	double precision, dimension(1:nz_vertical, 0:nn_horizontal) :: nonlinear_temp, nonlinear_omega
 	!Arrays of first and second derivatives in the z-direction:
-	double precision, dimension(1:nz_vertical, 0:nz_horizontal) :: dtemp_dz2, domega_dz2, &
+	double precision, dimension(1:nz_vertical, 0:nn_horizontal) :: dtemp_dz2, domega_dz2, &
 		dtemp_dz, dpsi_dz, domega_dz
-	double precision, dimension(1:nz_vertical, 0:nz_horizontal, 1:num_time_differences) :: &
+	double precision, dimension(1:nz_vertical, 0:nn_horizontal, 1:num_time_differences) :: &
 		domega_dt, dtemp_dt
-    double precision, dimension(1:nz_vertical, 1:nz_vertical) :: u_x, u_z
+    double precision, dimension(1:nz_vertical, 1:nz_vertical) :: ux_cfl, uz_cfl
+    !Purely spatial veriables for spectral transform method:
+    double precision, dimension(1:nz_vertical, 0:n_dft-1) :: ux_spatial, uz_spatial, & 
+        omega_spatial, temp_spatial, dtempdx_spatial, domegadx_spatial, &
+        domegadz_spatial, dtempdz_spatial
+        
+    !FFTW variables:
+    type(C_PTR) :: fft_plan, ifft_plan, dct_plan, dst_plan !FFT, discrete cosine, and discrete sine transform plans
+    complex(C_DOUBLE_COMPLEX), dimension(0:n_dft-1) :: in_fftw, out_fftw
 		
 	!PGPLOT variables:
 	integer :: pgplot_id		!PGPLOT handle
@@ -84,7 +102,7 @@ module hydro
         dt_old = dt
 		
 		write(*,*) 'Domain size parameters:'
-		write(*,'(a25,I25)') 'nz_horizontal:', nz_horizontal
+		write(*,'(a25,I25)') 'nn_horizontal:', nn_horizontal
 		write(*,'(a25,I25)') 'nz_vertical:', nz_vertical
 		write(*,'(a25,ES25.10)') 'a (aspect ratio):', a
 		write(*,'(a25,ES25.10)') 'dz:', dz
@@ -122,6 +140,10 @@ module hydro
 		omega_display(:,:) = 0d0
 		nonlinear_temp(:,:) = 0d0
 		nonlinear_omega(:,:) = 0d0
+        ux_spatial(:,:) = 0d0
+        uz_spatial(:,:) = 0d0
+        temp_spatial(:,:) = 0d0
+        omega_spatial(:,:) = 0d0
 		dtemp_dt(:,:,:) = 0d0
 		domega_dt(:,:,:) = 0d0
 		dtemp_dz(:,:) = 0d0 
@@ -135,11 +157,11 @@ module hydro
 			!Pick a temperature that satisfies the boundary conditions:
 			temp(k,0) = 1d0 - z(k)
 			temp(k,1) = 0.01*sin(pi*z(k))
-			temp(k,8) = 0.015*sin(pi*z(k))
-			!temp(k,1:nz_horizontal) = sin(pi*z(k))	!Works for all spatial rows
+			temp(k,8) = 0.01*sin(pi*z(k))
+			!temp(k,1:nn_horizontal) = sin(pi*z(k))	!Works for all spatial rows
 		end do
 		do k=1,nz_vertical
-			do n=1,nz_horizontal
+			do n=1,nn_horizontal
 				temp_display(:,k) = temp_display(:,k) + temp(:,n)*cos(n*pi*dz*(k-1))
 			end do
 		end do
@@ -153,6 +175,18 @@ module hydro
         
         avg_cfl_x = 0d0
         avg_cfl_z = 0d0
+        
+        !Create the FFTW plan if we're using the spectral transform method:
+        if(do_spectral_transform) then
+            !The input/output arrays are a single (z) row of the fluid variables since we're only
+            !transforming one dimension (do we need to specify specific arrays here?)
+            !in_fftw = temp_spatial(1,:)
+            !out_fftw = nonlinear_temp(1,:)
+            fft_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_FORWARD, FFTW_ESTIMATE)
+            ifft_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_BACKWARD, FFTW_ESTIMATE)
+            dct_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_REDFT10, FFTW_ESTIMATE)
+            dst_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_RODFT10, FFTW_ESTIMATE)
+        endif
 		
 		!Start up PGPLOT window:
 		if(use_pgplot) then
@@ -264,7 +298,7 @@ module hydro
 				dtemp_dz(k,:) = (temp(k+1,:) - temp(k-1,:))/(2*dz)
 				domega_dz(k,:) = (omega(k+1,:) - omega(k-1,:))/(2*dz)
 				dpsi_dz(k,:) = (psi(k+1,:) - psi(k-1,:))/(2*dz)
-				do i=1,nz_horizontal
+				do i=1,nn_horizontal
 					nonlinear_temp(k,0) = nonlinear_temp(k,0) - &
 						pi/(2*a)*(i*dpsi_dz(k,i)*temp(k,i) + &
 						i*psi(k,i)*dtemp_dz(k,i))
@@ -274,12 +308,12 @@ module hydro
 			
 			!Add in the n=0 piece of the nonlinear term:
             !(removed 7/21/14 beause of double counting in loop above) - now things are breaking around
-            !step 27,200 for the Ch.4 benchmark for initializing n=1 and n=8 modes for nz_horizontal = 50
-            !and breaks around step 7000 for nz_horizontal = 20,
-            !nz_horizontal = 10 went strong for at least 235,000 steps (still going)
+            !step 27,200 for the Ch.4 benchmark for initializing n=1 and n=8 modes for nn_horizontal = 50
+            !and breaks around step 7000 for nn_horizontal = 20,
+            !nn_horizontal = 10 went strong for at least 235,000 steps (still going)
             
 		!	!$OMP PARALLEL DO
-			!do i=1,nz_horizontal
+			!do i=1,nn_horizontal
 			!	nonlinear_temp(2:nz_vertical-1,0) = nonlinear_temp(2:nz_vertical-1,0) - &
 			!		pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i)*temp(2:nz_vertical-1,i) + &
 			!		i*psi(2:nz_vertical-1,i)*dtemp_dz(2:nz_vertical-1,i))
@@ -297,75 +331,207 @@ module hydro
 		dtemp_dt(2:nz_vertical-1,0,2) = dtemp_dz2(2:nz_vertical-1,0)
 		!domega_dt(2:nz_vertical-1,0,2) = prandtl*domega_dz2(2:nz_vertical-1,0) !No n=0 term for omega
         
-		!$OMP PARALLEL DO
-		do n=1,nz_horizontal
-			!Always need to compute the linear terms:
-			if(do_linear) then
-				dtemp_dt(2:nz_vertical-1,n,2) = (n*pi/a)*psi(2:nz_vertical-1,n) + &
-					(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
-				domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
-					prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
-			else
-				dtemp_dt(2:nz_vertical-1,n,2) = &	!Remove the linear approximation to the advection term
-					(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
-				domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
-					prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
-				!Add in the nonlinear terms using a Galerkin method (figure out which modes i
-				!contribute to the mode n being considered in the outer loop)
-				do i=1,nz_horizontal
-					!i+j = nn:
-					if((1.le.(n-i)).and.((n-i).le.nz_horizontal)) then
-						!write(*,*) 'Entering 1 < (n-i) < nz_horizontal branch:', (n-i)
-						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
-							pi/(2*a)*((n-i)*psi(2:nz_vertical-1,n-i)*domega_dz(2:nz_vertical-1,i) - &
-							i*dpsi_dz(2:nz_vertical-1,n-i)*omega(2:nz_vertical-1,i))
-						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
-							pi/(2*a)*(-i*dpsi_dz(2:nz_vertical-1,n-i)*temp(2:nz_vertical-1,i) + &
-							(n-i)*psi(2:nz_vertical-1,n-i)*dtemp_dz(2:nz_vertical-1,i))
-					endif
-					!i-j = nn:
-					if((1.le.(i-n)).and.((i-n).le.nz_horizontal)) then
-						!write(*,*) 'Entering 1 < (i-n) < nz_horizontal branch:', (i-n)
-						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
-							pi/(2*a)*((i-n)*psi(2:nz_vertical-1,i-n)*domega_dz(2:nz_vertical-1,i) + &
-							i*dpsi_dz(2:nz_vertical-1,i-n)*omega(2:nz_vertical-1,i))
-						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
-							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i-n)*temp(2:nz_vertical-1,i) + &
-							(i-n)*psi(2:nz_vertical-1,i-n)*dtemp_dz(2:nz_vertical-1,i))
-                        !write(*,*) nonlinear_temp(3, n)
-					endif
-					!j-i = nn:
-					if((1.le.(i+n)).and.((i+n).le.nz_horizontal)) then
-						!write(*,*) 'Entering 1 < (i+n) < nz_horizontal branch:', (i+n)
-						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) + & 
-							pi/(2*a)*((i+n)*psi(2:nz_vertical-1,i+n)*domega_dz(2:nz_vertical-1,i) + &
-							i*dpsi_dz(2:nz_vertical-1,i+n)*omega(2:nz_vertical-1,i))
-						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
-							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i+n)*temp(2:nz_vertical-1,i) + &
-							(i+n)*psi(2:nz_vertical-1,i+n)*dtemp_dz(2:nz_vertical-1,i))
-                        !write(*,*) nonlinear_temp(3, n)
-					endif
+        if(.not.do_spectral_transform) then
+            !$OMP PARALLEL DO
+    		do n=1,nn_horizontal
+    			!Always need to compute the linear terms:
+    			if(do_linear) then
+    				dtemp_dt(2:nz_vertical-1,n,2) = (n*pi/a)*psi(2:nz_vertical-1,n) + &
+    					(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
+    				domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
+    					prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
+    			else
+    				dtemp_dt(2:nz_vertical-1,n,2) = &	!Remove the linear approximation to the advection term
+    					(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
+    				domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
+    					prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
+    				!Add in the nonlinear terms using a Galerkin method (figure out which modes i
+    				!contribute to the mode n being considered in the outer loop)
+    				do i=1,nn_horizontal
+    					!i+j = nn:
+    					if((1.le.(n-i)).and.((n-i).le.nn_horizontal)) then
+    						!write(*,*) 'Entering 1 < (n-i) < nn_horizontal branch:', (n-i)
+    						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
+    							pi/(2*a)*((n-i)*psi(2:nz_vertical-1,n-i)*domega_dz(2:nz_vertical-1,i) - &
+    							i*dpsi_dz(2:nz_vertical-1,n-i)*omega(2:nz_vertical-1,i))
+    						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+    							pi/(2*a)*(-i*dpsi_dz(2:nz_vertical-1,n-i)*temp(2:nz_vertical-1,i) + &
+    							(n-i)*psi(2:nz_vertical-1,n-i)*dtemp_dz(2:nz_vertical-1,i))
+    					endif
+    					!i-j = nn:
+    					if((1.le.(i-n)).and.((i-n).le.nn_horizontal)) then
+    						!write(*,*) 'Entering 1 < (i-n) < nn_horizontal branch:', (i-n)
+    						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) - &
+    							pi/(2*a)*((i-n)*psi(2:nz_vertical-1,i-n)*domega_dz(2:nz_vertical-1,i) + &
+    							i*dpsi_dz(2:nz_vertical-1,i-n)*omega(2:nz_vertical-1,i))
+    						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+    							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i-n)*temp(2:nz_vertical-1,i) + &
+    							(i-n)*psi(2:nz_vertical-1,i-n)*dtemp_dz(2:nz_vertical-1,i))
+                            !write(*,*) nonlinear_temp(3, n)
+    					endif
+    					!j-i = nn:
+    					if((1.le.(i+n)).and.((i+n).le.nn_horizontal)) then
+    						!write(*,*) 'Entering 1 < (i+n) < nn_horizontal branch:', (i+n)
+    						nonlinear_omega(2:nz_vertical-1,n) = nonlinear_omega(2:nz_vertical-1,n) + & 
+    							pi/(2*a)*((i+n)*psi(2:nz_vertical-1,i+n)*domega_dz(2:nz_vertical-1,i) + &
+    							i*dpsi_dz(2:nz_vertical-1,i+n)*omega(2:nz_vertical-1,i))
+    						nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+    							pi/(2*a)*(i*dpsi_dz(2:nz_vertical-1,i+n)*temp(2:nz_vertical-1,i) + &
+    							(i+n)*psi(2:nz_vertical-1,i+n)*dtemp_dz(2:nz_vertical-1,i))
+                            !write(*,*) nonlinear_temp(3, n)
+    					endif
 					
-					!read(*,*)
-				end do
+    					!read(*,*)
+    				end do
 				
-				!lastly, the term outside the double sum with dT0/dz (only depends on n):
-				nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
-					(n*pi/a)*dtemp_dz(2:nz_vertical-1,0)*psi(2:nz_vertical-1,n)
+    				!lastly, the term outside the double sum with dT0/dz (only depends on n):
+    				nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
+    					(n*pi/a)*dtemp_dz(2:nz_vertical-1,0)*psi(2:nz_vertical-1,n)
 					
-				!Now that the nonlinear terms are computed, add them to the time derivatives:
-				!dtemp_dt(2:nz_vertical-1,n,2) = dtemp_dt(2:nz_vertical-1,n,2) + &
-				!	nonlinear_temp(2:nz_vertical-1,n)
-				!domega_dt(2:nz_vertical-1,n,2) = domega_dt(2:nz_vertical-1,n,2) + &
-				!	nonlinear_omega(2:nz_vertical-1,n)
-				if(dbg) then
-					write(*,*) 'Final nonlinear terms:'
-					write(*,*) n, nonlinear_temp(nz_vertical/3,n), nonlinear_omega(nz_vertical/3,n)
-				endif
+    				!Now that the nonlinear terms are computed, add them to the time derivatives:
+    				!dtemp_dt(2:nz_vertical-1,n,2) = dtemp_dt(2:nz_vertical-1,n,2) + &
+    				!	nonlinear_temp(2:nz_vertical-1,n)
+    				!domega_dt(2:nz_vertical-1,n,2) = domega_dt(2:nz_vertical-1,n,2) + &
+    				!	nonlinear_omega(2:nz_vertical-1,n)
+    				if(dbg) then
+    					write(*,*) 'Final nonlinear terms:'
+    					write(*,*) n, nonlinear_temp(nz_vertical/3,n), nonlinear_omega(nz_vertical/3,n)
+    				endif
+    			endif !do_linear 
+            end do
+            !$OMP END PARALLEL DO
+        endif !do_spectral transform
+        
+        if(do_spectral_transform) then
+            do n=1,nn_horizontal
+    			dtemp_dt(2:nz_vertical-1,n,2) = &	!Remove the linear approximation to the advection term
+    				(dtemp_dz2(2:nz_vertical-1,n) - temp(2:nz_vertical-1,n)*(n*pi/a)**2)
+    			domega_dt(2:nz_vertical-1,n,2) = rayleigh*prandtl*(n*pi/a)*temp(2:nz_vertical-1,n) + &
+    				prandtl*(domega_dz2(2:nz_vertical-1,n) - omega(2:nz_vertical-1,n)*(n*pi/a)**2)
+            end do
+            !write(*,*) "Engaging spectral transform!"
+            ux_spatial(:,:) = 0d0
+            uz_spatial(:,:) = 0d0
+            omega_spatial(:,:) = 0d0
+            temp_spatial(:,:) = 0d0
+            domegadz_spatial(:,:) = 0d0
+            dtempdz_spatial(:,:) = 0d0
+            !First step is to convert to spatial coordinates:
+            !Convert the horizontal Fourier modes into real space
+        	!do i=0,n_dft-1
+        	!	do n=0,nn_horizontal
+        	!		ux_spatial(:,i) = ux_spatial(:,i) - dpsi_dz(:,n)*sin(n*pi*dx*i/a)
+        	!		uz_spatial(:,i) = uz_spatial(:,i) + (n*pi/a)*psi(:,n)*cos(n*pi*dx*i/a)
+            !        omega_spatial(:,i) = omega_spatial(:,i) + omega(:,n)*sin(n*pi*dx*i/a)
+            !        temp_spatial(:,i) = temp_spatial(:,i) + temp(:,n)*cos(n*pi*dx*i/a)
+            !        domegadz_spatial(:,i) = domegadz_spatial(:,i) + domega_dz(:,n)*sin(n*pi*dx*i/a)
+            !        dtempdz_spatial(:,i) = dtempdz_spatial(:,i) + dtemp_dz(:,n)*cos(n*pi*dx*i/a)
+        	!	end do
+            !end do
+            !write(*,*) 'ux_spatial (nz_vertical/3,:) direct sum:'
+            !write(*,*) ux_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'omega_spatial (nz_vertical/3,:) direct sum:'
+            !write(*,*) omega_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'domegadz_spatial (nz_vertical/3,:) direct sum:'
+            !write(*,*) domegadz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            
+            !Faster to do this with an inverse FFT:
+            do k=1, nz_vertical
+                in_fftw = 0d0
+                in_fftw(0:nn_horizontal) = -dpsi_dz(k,0:nn_horizontal)
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                ux_spatial(k,:) = imagpart(out_fftw)
                 
-			endif !do_linear
-		end do
-		!$OMP END PARALLEL DO
+                in_fftw = 0d0
+                do n=0, nn_horizontal
+                    in_fftw(n) = (n*pi/a)*psi(k,n)
+                end do
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                uz_spatial(k,:) = realpart(out_fftw)
+                
+                in_fftw = 0d0
+                in_fftw(0:nn_horizontal) = omega(k,0:nn_horizontal)
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                omega_spatial(k,:) = imagpart(out_fftw)
+                
+                in_fftw = 0d0
+                in_fftw(0:nn_horizontal) = temp(k,0:nn_horizontal)
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                temp_spatial(k,:) = realpart(out_fftw)
+                
+                in_fftw = 0d0
+                in_fftw(0:nn_horizontal) = domega_dz(k,0:nn_horizontal)
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                domegadz_spatial(k,:) = imagpart(out_fftw)
+                
+                in_fftw = 0d0
+                in_fftw(0:nn_horizontal) = dtemp_dz(k,0:nn_horizontal)
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                dtempdz_spatial(k,:) = realpart(out_fftw)
+            end do
+            !write(*,*) 'ux_spatial (nz_vertical/3,:) iFFT:'
+            !write(*,*) ux_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'omega_spatial (nz_vertical/3,:) iFFT:'
+            !write(*,*) omega_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'domegadz_spatial (nz_vertical/3,:) iFFT:'
+            !write(*,*) domegadz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            
+            !Next, we multiply the nonlinear terms together and convert them back to 
+            !spectral space (each row at a time). One question - should we differentiate in the 
+            !horiontal direction before or after we conver to spatial coordinates?
+            
+            !Differentiating after the inverse FFT:
+            dtempdx_spatial(:,:) = 0d0
+            domegadx_spatial(:,:) = 0d0
+            do i=1,n_dft-2
+                dtempdx_spatial(:,i) = (temp_spatial(:,i+1) - temp_spatial(:,i-1))/(2*dx)
+                domegadx_spatial(:,i) = (omega_spatial(:,i+1) - omega_spatial(:,i-1))/(2*dx)
+            end do
+            
+            !Output Galerkin method results:
+            !write(*,*) 'Galerkin:'
+            !write(*,'(a5,2a25)') 'n','nonlinear_temp','nonlinear_omega'
+    	    !do i=0,nn_horizontal
+            !    write(*,'(i5,3ES25.10)') i, nonlinear_temp(nz_vertical/3,i), nonlinear_omega(nz_vertical/3,i)
+    		!end do 
+            !write(*,*)
+            
+            do k=1,nz_vertical
+                in_fftw = 0d0
+                in_fftw = -ux_spatial(k,:)*dtempdx_spatial(k,:) - uz_spatial(k,:)*dtempdz_spatial(k,:)
+                !out_fftw = nonlinear_temp(k,:)
+                call fftw_execute_dft(fft_plan, in_fftw, out_fftw)
+                !write(*,*) out_fftw(0:nn_horizontal)
+                !if(mod(k,50).eq.0) then
+                !    write(*,*) in_fftw
+                !    write(*,*) out_fftw
+                !endif
+                nonlinear_temp(k,:) = realpart(out_fftw(0:nn_horizontal))/n_dft
+                nonlinear_temp(k,1:nn_horizontal) = 2*nonlinear_temp(k,1:nn_horizontal) !not sure why yet
+                
+                in_fftw = 0d0
+                in_fftw = -ux_spatial(k,:)*domegadx_spatial(k,:) - uz_spatial(k,:)*domegadz_spatial(k,:)
+                !out_fftw = nonlinear_omega(k,:)
+                call fftw_execute_dft(fft_plan, in_fftw, out_fftw)
+                nonlinear_omega(k,:) = -imagpart(out_fftw(0:nn_horizontal))/n_dft !WHY IS A NEGATIVE SIGN NEEDED HERE?? Perhaps something to do with a complex conjugate somewhere...
+                nonlinear_omega(k,1:nn_horizontal) = 2*nonlinear_omega(k,1:nn_horizontal) !not sure why yet
+            end do
+            
+            !Output spectral transform results:
+            !write(*,*) 'Spectral transform:'
+            !write(*,'(a5,2a25)') 'n','nonlinear_temp','nonlinear_omega'
+    		!do i=0,nn_horizontal
+            !    write(*,'(i5,3ES25.10)') i, nonlinear_temp(nz_vertical/3,i), nonlinear_omega(nz_vertical/3,i)
+    		!end do 
+            !write(*,*)
+            
+        endif !do_spectral_transform
 
 		!Add in all the nonlinear terms (only nonzero if do_linear = .false.)
 		dtemp_dt(2:nz_vertical-1,:,2) = dtemp_dt(2:nz_vertical-1,:,2) + &
@@ -397,7 +563,7 @@ module hydro
 		!Check for NaN values:
 		! !$OMP PARALLEL DO
 		!do k=1,nz_vertical
-		!	do n=0,nz_horizontal
+		!	do n=0,nn_horizontal
 		!		if (isnan(temp(k,n))) then
 		!			write(*,*) '"temp" is a NaN', k, n
 		!			stop 20
@@ -413,7 +579,7 @@ module hydro
 		!Then find the streamfunction psi by doing a Poisson solve with our tridiagonal
 		!matrix routine.
 		!$OMP PARALLEL DO
-		do n=1,nz_horizontal
+		do n=1,nn_horizontal
 			call gen_tridiag_matrix(n)
 			call tridi(nz_vertical,omega(:,n),psi(:,n),sub,dia,sup,wk1,wk2)
 		end do
@@ -426,7 +592,7 @@ module hydro
 	end subroutine evolve_step
     
     !Checks the CFL condition (||
-    !u_x = -dpsi_dz, u_z = dpsi_dx
+    !ux_cfl = -dpsi_dz, uz_cfl = dpsi_dx
     subroutine check_cfl(step_num)
         
         integer, intent(in) :: step_num
@@ -445,32 +611,32 @@ module hydro
             stop 1
         endif
         
-        u_x(:,:) = 0d0
-        u_z(:,:) = 0d0
+        ux_cfl(:,:) = 0d0
+        uz_cfl(:,:) = 0d0
         dt_old = dt
         
         !Convert the horizontal Fourier modes into real space
 		do k=1,nz_vertical
-			do n=0,nz_horizontal
-				u_x(:,k) = u_x(:,k) - dpsi_dz(:,n)*sin(n*pi*dz*k)
-				u_z(:,k) = u_z(:,k) + (n*pi/a)*psi(:,n)*cos(n*pi*dz*k)
+			do n=0,nn_horizontal
+				ux_cfl(:,k) = ux_cfl(:,k) - dpsi_dz(:,n)*sin(n*pi*dz*k)
+				uz_cfl(:,k) = uz_cfl(:,k) + (n*pi/a)*psi(:,n)*cos(n*pi*dz*k)
 			end do
 		end do
         
-        cfl_x = (a/nz_horizontal)/maxval(abs(u_x))
-        cfl_z = dz/maxval(abs(u_z))
-        !write(*,*) 'max u_x, dx/u_x:', (a/nz_horizontal)/cfl_x, cfl_x
-        !write(*,*) 'max u_z, dz/u_z:', dz/cfl_z, cfl_z
+        cfl_x = (a/nn_horizontal)/maxval(abs(ux_cfl))
+        cfl_z = dz/maxval(abs(uz_cfl))
+        !write(*,*) 'max ux_cfl, dx/ux_cfl:', (a/nn_horizontal)/cfl_x, cfl_x
+        !write(*,*) 'max uz_cfl, dz/uz_cfl:', dz/cfl_z, cfl_z
         !Compute running averages:
         avg_cfl_x = (avg_cfl_x*(step_num/cfl_tick - 1) + cfl_x)/(step_num/cfl_tick)
         avg_cfl_z = (avg_cfl_z*(step_num/cfl_tick - 1) + cfl_z)/(step_num/cfl_tick)
         
         !Reduce the timestep, if necessary:
-        if((a/nz_horizontal)/maxval(u_x).lt.dt*cfl_timestep_limit_factor) then
+        if((a/nn_horizontal)/maxval(ux_cfl).lt.dt*cfl_timestep_limit_factor) then
             dt = dt*cfl_reduction_factor
             write(*,*) 'Reducing timestep due to CFL condition (x-direction)', dt
         endif
-        if(dz/maxval(u_z).lt.dt*cfl_timestep_limit_factor) then
+        if(dz/maxval(uz_cfl).lt.dt*cfl_timestep_limit_factor) then
             dt = dt*cfl_reduction_factor
             write(*,*) 'Reducing timestep due to CFL condition (z-direction)', dt
         endif
@@ -504,7 +670,7 @@ module hydro
 		!write(*,'(a25,99ES25.10)') 'domega_dt(nz/3,:,1):', domega_dt(nz_vertical/3,:,1)
 		
 		!write(*,'(a40)') 'non-zero mode temp growth(nz/3,:):'
-		!do i=0,nz_horizontal
+		!do i=0,nn_horizontal
 		!	if((temp(nz_vertical/3,i).ne.0d0).and.(prev_temp(nz_vertical/3,i).ne.0d0)) then
 		!		write(*,'(a17,i2,a3,ES25.10)') 'temp growth(nz/3,',i,'):', &
 		!			log(abs(temp(nz_vertical/3,i))) - log(abs(prev_temp(nz_vertical/3,i)))
@@ -515,14 +681,14 @@ module hydro
 		!write(*,*)
         
         write(*,'(a5,3a25)') 'n','temp','omega','psi'
-		do i=0,nz_horizontal
+		do i=0,nn_horizontal
             write(*,'(i5,3ES25.10)') i, temp(nz_vertical/3,i), omega(nz_vertical/3,i), psi(nz_vertical/3,i)
 			!write(*,'(a17,i2,a3,ES25.10)') 'temp(nz/3,',i,'):', temp(nz_vertical/3,i)
             !write(*,'(a17,i2,a3,ES25.10)') 'omega(nz/3,',i,'):', omega(nz_vertical/3,i)
             !write(*,'(a17,i2,a3,ES25.10)') 'psi(nz/3,',i,'):', psi(nz_vertical/3,i)
 		end do
         
-		!do i=0,nz_horizontal
+		!do i=0,nn_horizontal
 		!	write(*,'(a17,i2,a3,999ES25.10)') 'dtemp_dt(z(i),',i,'):', dtemp_dt(1:nz_vertical,i,2)
         !    write(*,'(a17,i2,a3,999ES25.10)') 'domega_dt(z(i),',i,'):', domega_dt(1:nz_vertical,i,2)
 
@@ -575,20 +741,23 @@ module hydro
 		omega_display(:,:) = 0d0
 		!$OMP PARALLEL DO
 		do k=1,nz_vertical
-			do n=0,nz_horizontal
+			do n=0,nn_horizontal
 				temp_display(:,k) = temp_display(:,k) + temp(:,n)*cos(n*pi*dz*k)
 				omega_display(:,k) = omega_display(:,k) + omega(:,n)*sin(n*pi*dz*k)
 			end do
 		end do
 		!$OMP END PARALLEL DO
 		
-		!call pgimag (real(temp_display), nz_vertical, nz_horizontal, i1, i2, j1, j2, a1, a2, tr)
+		!call pgimag (real(temp_display), nz_vertical, nn_horizontal, i1, i2, j1, j2, a1, a2, tr)
 		!call pgpage()
 		call pgimag (real(temp_display), nz_vertical, nz_vertical, i1, i2, j1, j2, a1, a2, tr)
 	end subroutine plot_vals
 	
 	!Deallocates and cleans up all data, file IO streams, etc.
 	subroutine shutdown
+        if(do_spectral_transform) then
+            call fftw_destroy_plan(fft_plan)
+        endif
 		call pgclos()
 	end subroutine shutdown
 
