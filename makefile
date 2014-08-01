@@ -3,7 +3,8 @@
 # STEP 1: set the LAPACK directory
  
 FC = gfortran
-FCbasic = -fno-range-check -fmax-errors=100 $(SPECIAL_FC_FLAGS) -fprotect-parens -fno-sign-zero
+#FCbasic = -fno-range-check -fmax-errors=100 $(SPECIAL_FC_FLAGS) -fprotect-parens -fno-sign-zero
+FCbasic = -fno-range-check -fmax-errors=100 -O3
 FCfree = -ffree-form $(FC_free_preprocess)
 FCopenmp = -fopenmp
 

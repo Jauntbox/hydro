@@ -10,9 +10,14 @@ program main
     integer, parameter :: size_dft = 2*(size_spatial) !Number of points to use in the DFT (in order to turn 2*pi*k arguments in the DFT into pi*k arguements)
     double precision, parameter :: dx = 1d0/(size_spatial)
     double precision, parameter :: pi = 4d0*atan(1d0)
+    
+    logical, parameter :: use_aligned = .true.
     type(C_PTR) :: fft_plan, ifft_plan, dct_plan, idct_plan
     complex(C_DOUBLE_COMPLEX), dimension(0:size) :: in, out, product_spectral_complex
     complex(C_DOUBLE_COMPLEX), dimension(0:size_dft-1) :: in_spatial, out_spatial
+    complex(C_DOUBLE_COMPLEX), pointer :: in_aligned(:), out_aligned(:)
+    type(C_PTR) :: p_in, p_out
+    
     double precision, dimension(0:size) :: in_real, out_real
     double precision, dimension(0:size) :: a_spectral, b_spectral, product_spectral
     double precision, dimension(0:2*size) :: product_spectral_full
@@ -24,6 +29,13 @@ program main
     out(:) = 0
     in_real(:) = 0
     out_real(:) = 0
+    
+    if(use_aligned) then
+        p_in = fftw_alloc_complex(int(size_dft, C_SIZE_T))
+        call c_f_pointer(p_in, in_aligned, [size_dft])
+        p_out = fftw_alloc_complex(int(size_dft, C_SIZE_T))
+        call c_f_pointer(p_out, out_aligned, [size_dft])
+    endif
     
     do i=0,size-1
         !in(i) = sin(2*i*pi/size) 
@@ -39,10 +51,17 @@ program main
     write(*,*)
     
     !Create the plans (one for forward transform, one for backward one - switches sign in exponent)
-    !dct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_REDFT10, FFTW_ESTIMATE)
-    dct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_FORWARD, FFTW_ESTIMATE)
-    !idct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_REDFT01, FFTW_ESTIMATE)
-    idct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_BACKWARD, FFTW_ESTIMATE)
+    if(use_aligned) then
+        !dct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_REDFT10, FFTW_ESTIMATE)
+        dct_plan = fftw_plan_dft_1d(size_dft, in_aligned, out_aligned, FFTW_FORWARD, FFTW_ESTIMATE)
+        !idct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_REDFT01, FFTW_ESTIMATE)
+        idct_plan = fftw_plan_dft_1d(size_dft, in_aligned, out_aligned, FFTW_BACKWARD, FFTW_ESTIMATE)
+    else
+        !dct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_REDFT10, FFTW_ESTIMATE)
+        dct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_FORWARD, FFTW_ESTIMATE)
+        !idct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_REDFT01, FFTW_ESTIMATE)
+        idct_plan = fftw_plan_dft_1d(size_dft, in_spatial, out_spatial, FFTW_BACKWARD, FFTW_ESTIMATE)
+    endif
     fft_plan = fftw_plan_dft_1d(size, in,out, FFTW_FORWARD, FFTW_ESTIMATE)
     ifft_plan = fftw_plan_dft_1d(size, in,out, FFTW_BACKWARD, FFTW_ESTIMATE)
     
@@ -79,23 +98,41 @@ program main
     write(*,*)
     
     !Do the same with the inverse FFT (frequency -> spatial):
-    in_spatial = 0d0
-    in_spatial(0:size) = a_spectral
-    call fftw_execute_dft(idct_plan, in_spatial, out_spatial)
-    a_spatial = out_spatial
+    if(use_aligned) then
+        in_aligned = 0d0
+        in_aligned(0:size) = a_spectral
+        call fftw_execute_dft(idct_plan, in_aligned, out_aligned)
+        a_spatial = out_aligned
+    else
+        in_spatial = 0d0
+        in_spatial(0:size) = a_spectral
+        call fftw_execute_dft(idct_plan, in_spatial, out_spatial)
+        a_spatial = out_spatial
+    endif
     write(*,*) 'In space, we have (iFFT of a):'
     write(*,*) a_spatial
     write(*,*)
     
     !Now, try converting it back to spectral coordinates with the FFT:
-    in_spatial = a_spatial(:)
-    call fftw_execute_dft(dct_plan, in_spatial, out_spatial)
-    a_spectral = realpart(out_spatial(0:size))/(size_dft)
-    write(*,*) 'Transformed back to spectral coordinates, we have (a):'
-    write(*,*) realpart(out_spatial)/size_dft
-    write(*,*)
-    write(*,*) imagpart(out_spatial)/size_dft
-    write(*,*)
+    if(use_aligned) then
+        in_aligned = a_spatial(:)
+        call fftw_execute_dft(dct_plan, in_aligned, out_aligned)
+        a_spectral = realpart(out_aligned(0:size))/(size_dft)
+        write(*,*) 'Transformed back to spectral coordinates, we have (a):'
+        write(*,*) realpart(out_aligned)/size_dft
+        write(*,*)
+        write(*,*) imagpart(out_aligned)/size_dft
+        write(*,*)
+    else
+        in_spatial = a_spatial(:)
+        call fftw_execute_dft(dct_plan, in_spatial, out_spatial)
+        a_spectral = realpart(out_spatial(0:size))/(size_dft)
+        write(*,*) 'Transformed back to spectral coordinates, we have (a):'
+        write(*,*) realpart(out_spatial)/size_dft
+        write(*,*)
+        write(*,*) imagpart(out_spatial)/size_dft
+        write(*,*)
+    endif
     
     
     !Next thing to try is to reconstruct a product in real space from a spectral transform
@@ -163,7 +200,7 @@ program main
     !Check the product obtained by hand
     product_spatial(:) = 0d0
     do i=0,size_dft-1
-        do n=0,2*size
+        do n=0,size
             product_spatial(i) = product_spatial(i) + product_spectral_full(n)*cos(n*pi*i*dx)
         end do
     end do
@@ -175,5 +212,9 @@ program main
     call fftw_destroy_plan(idct_plan)
     call fftw_destroy_plan(fft_plan)
     call fftw_destroy_plan(ifft_plan)
+    
+    !Deallocate arrays as well:
+    call fftw_free(p_in)
+    call fftw_free(p_out)
     
 end program

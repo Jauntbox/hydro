@@ -15,7 +15,7 @@ module hydro
 	!Overall simulation parameters:
 	!Only solve the linear problem (eg. equations )
 	logical, parameter :: do_linear = .false.
-    logical, parameter :: do_spectral_transform = .true.
+    logical, parameter :: do_spectral_transform = .false.
 	logical, parameter :: use_pgplot = .true.
 	logical, parameter :: dbg = .false.		!If true, print debugging output to the screen
 	
@@ -28,7 +28,7 @@ module hydro
     integer, parameter :: n_dft = 2*nz_horizontal
 	double precision, parameter :: dz = 1d0/(nz_vertical-1)	!spacing in the z-direction
     double precision, parameter :: dx = 1d0/(nz_horizontal)	!spacing in the x-direction
-	double precision, parameter :: a = 1.0	!horizontal/vertical length scale
+	double precision, parameter :: a = 3.0	!horizontal/vertical length scale
 	
 	!Timestep parameters:
 	double precision :: dt	!Gets set in initialize()
@@ -64,11 +64,13 @@ module hydro
     !Purely spatial veriables for spectral transform method:
     double precision, dimension(1:nz_vertical, 0:n_dft-1) :: ux_spatial, uz_spatial, & 
         omega_spatial, temp_spatial, dtempdx_spatial, domegadx_spatial, &
-        domegadz_spatial, dtempdz_spatial
+        domegadz_spatial, dtempdz_spatial, galerkin_test
         
     !FFTW variables:
     type(C_PTR) :: fft_plan, ifft_plan, dct_plan, dst_plan !FFT, discrete cosine, and discrete sine transform plans
     complex(C_DOUBLE_COMPLEX), dimension(0:n_dft-1) :: in_fftw, out_fftw
+    complex(C_DOUBLE_COMPLEX), pointer :: in_aligned(:), out_aligned(:)
+    type(C_PTR) :: p_in, p_out
 		
 	!PGPLOT variables:
 	integer :: pgplot_id		!PGPLOT handle
@@ -161,8 +163,8 @@ module hydro
 			!temp(k,1:nn_horizontal) = sin(pi*z(k))	!Works for all spatial rows
 		end do
 		do k=1,nz_vertical
-			do n=1,nn_horizontal
-				temp_display(:,k) = temp_display(:,k) + temp(:,n)*cos(n*pi*dz*(k-1))
+			do n=0,nn_horizontal
+				temp_display(:,k) = temp_display(:,k) + temp(:,n)*cos(n*pi*dz*k)
 			end do
 		end do
 		
@@ -416,26 +418,43 @@ module hydro
             temp_spatial(:,:) = 0d0
             domegadz_spatial(:,:) = 0d0
             dtempdz_spatial(:,:) = 0d0
+            dtempdx_spatial(:,:) = 0d0
+            domegadx_spatial(:,:) = 0d0
             !First step is to convert to spatial coordinates:
             !Convert the horizontal Fourier modes into real space
-        	!do i=0,n_dft-1
-        	!	do n=0,nn_horizontal
-        	!		ux_spatial(:,i) = ux_spatial(:,i) - dpsi_dz(:,n)*sin(n*pi*dx*i/a)
-        	!		uz_spatial(:,i) = uz_spatial(:,i) + (n*pi/a)*psi(:,n)*cos(n*pi*dx*i/a)
-            !        omega_spatial(:,i) = omega_spatial(:,i) + omega(:,n)*sin(n*pi*dx*i/a)
-            !        temp_spatial(:,i) = temp_spatial(:,i) + temp(:,n)*cos(n*pi*dx*i/a)
-            !        domegadz_spatial(:,i) = domegadz_spatial(:,i) + domega_dz(:,n)*sin(n*pi*dx*i/a)
-            !        dtempdz_spatial(:,i) = dtempdz_spatial(:,i) + dtemp_dz(:,n)*cos(n*pi*dx*i/a)
-        	!	end do
-            !end do
+        	do i=0,n_dft-1
+        		do n=0,nn_horizontal
+        			ux_spatial(:,i) = ux_spatial(:,i) - dpsi_dz(:,n)*sin(n*pi*dx*i/a)
+        			uz_spatial(:,i) = uz_spatial(:,i) + (n*pi/a)*psi(:,n)*cos(n*pi*dx*i/a)
+                    omega_spatial(:,i) = omega_spatial(:,i) + omega(:,n)*sin(n*pi*dx*i/a)
+                    temp_spatial(:,i) = temp_spatial(:,i) + temp(:,n)*cos(n*pi*dx*i/a)
+                    domegadz_spatial(:,i) = domegadz_spatial(:,i) + domega_dz(:,n)*sin(n*pi*dx*i/a)
+                    dtempdz_spatial(:,i) = dtempdz_spatial(:,i) + dtemp_dz(:,n)*cos(n*pi*dx*i/a)
+                    dtempdx_spatial(:,i) = dtempdx_spatial(:,i) - (n*pi/a)*temp(:,n)*sin(n*pi*dx*i/a)
+                    domegadx_spatial(:,i) = domegadx_spatial(:,i) + (n*pi/a)*omega(:,n)*cos(n*pi*dx*i/a)
+        		end do
+            end do
+            galerkin_test = dtempdx_spatial
             !write(*,*) 'ux_spatial (nz_vertical/3,:) direct sum:'
             !write(*,*) ux_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'uz_spatial (nz_vertical/3,:) direct sum:'
+            !write(*,*) uz_spatial(nz_vertical/3,:)
             !write(*,*)
             !write(*,*) 'omega_spatial (nz_vertical/3,:) direct sum:'
             !write(*,*) omega_spatial(nz_vertical/3,:)
             !write(*,*)
             !write(*,*) 'domegadz_spatial (nz_vertical/3,:) direct sum:'
             !write(*,*) domegadz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'temp_spatial (nz_vertical/3,:) direct sum:'
+            !write(*,*) temp_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'dtempdz_spatial (nz_vertical/3,:) direct sum:'
+            !write(*,*) dtempdz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'dtempdz_spatial (nz_vertical/3,:) direct sum:'
+            !write(*,*) dtempdz_spatial(nz_vertical/3,:)
             !write(*,*)
             
             !Faster to do this with an inverse FFT:
@@ -458,14 +477,14 @@ module hydro
                 omega_spatial(k,:) = imagpart(out_fftw)
                 
                 in_fftw = 0d0
-                in_fftw(0:nn_horizontal) = temp(k,0:nn_horizontal)
-                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
-                temp_spatial(k,:) = realpart(out_fftw)
-                
-                in_fftw = 0d0
                 in_fftw(0:nn_horizontal) = domega_dz(k,0:nn_horizontal)
                 call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
                 domegadz_spatial(k,:) = imagpart(out_fftw)
+                
+                in_fftw = 0d0
+                in_fftw(0:nn_horizontal) = temp(k,0:nn_horizontal)
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                temp_spatial(k,:) = realpart(out_fftw)
                 
                 in_fftw = 0d0
                 in_fftw(0:nn_horizontal) = dtemp_dz(k,0:nn_horizontal)
@@ -475,24 +494,59 @@ module hydro
             !write(*,*) 'ux_spatial (nz_vertical/3,:) iFFT:'
             !write(*,*) ux_spatial(nz_vertical/3,:)
             !write(*,*)
+            !write(*,*) 'uz_spatial (nz_vertical/3,:) iFFT:'
+            !write(*,*) uz_spatial(nz_vertical/3,:)
+            !write(*,*)
             !write(*,*) 'omega_spatial (nz_vertical/3,:) iFFT:'
             !write(*,*) omega_spatial(nz_vertical/3,:)
             !write(*,*)
             !write(*,*) 'domegadz_spatial (nz_vertical/3,:) iFFT:'
             !write(*,*) domegadz_spatial(nz_vertical/3,:)
             !write(*,*)
+            !write(*,*) 'temp_spatial (nz_vertical/3,:) iFFT:'
+            !write(*,*) temp_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'dtempdz_spatial (nz_vertical/3,:) iFFT:'
+            !write(*,*) dtempdz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            
+            !write(*,*) 'absolute difference: ux_spatial (nz_vertical/3,:)'
+            !write(*,*) galerkin_test(nz_vertical/3,:) - ux_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'absolute difference: uz_spatial (nz_vertical/3,:)'
+            !write(*,*) galerkin_test(nz_vertical/3,:) - uz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'absolute difference: omega_spatial (nz_vertical/3,:)'
+            !write(*,*) galerkin_test(nz_vertical/3,:) - omega_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'absolute difference: domegadz_spatial (nz_vertical/3,:)'
+            !write(*,*) galerkin_test(nz_vertical/3,:) - domegadz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'absolute difference: temp_spatial (nz_vertical/3,:)'
+            !write(*,*) galerkin_test(nz_vertical/3,:) - temp_spatial(nz_vertical/3,:)
+            !write(*,*)
+            !write(*,*) 'absolute difference: dtempdz_spatial (nz_vertical/3,:)'
+            !write(*,*) galerkin_test(nz_vertical/3,:) - dtempdz_spatial(nz_vertical/3,:)
+            !write(*,*)
+            
+            !Ok - all absolute differences have been checked to be ~1d-16 (machine precision) (07/31/14)
             
             !Next, we multiply the nonlinear terms together and convert them back to 
             !spectral space (each row at a time). One question - should we differentiate in the 
             !horiontal direction before or after we conver to spatial coordinates?
             
             !Differentiating after the inverse FFT:
-            dtempdx_spatial(:,:) = 0d0
-            domegadx_spatial(:,:) = 0d0
-            do i=1,n_dft-2
-                dtempdx_spatial(:,i) = (temp_spatial(:,i+1) - temp_spatial(:,i-1))/(2*dx)
-                domegadx_spatial(:,i) = (omega_spatial(:,i+1) - omega_spatial(:,i-1))/(2*dx)
-            end do
+            !(perhaps I should differentiate before the iFFT to agree with Galerkin?)
+            !dtempdx_spatial(:,:) = 0d0
+            !domegadx_spatial(:,:) = 0d0
+            !do i=1,n_dft-2
+            !    dtempdx_spatial(:,i) = (temp_spatial(:,i+1) - temp_spatial(:,i-1))/(2*dx)
+            !    domegadx_spatial(:,i) = (omega_spatial(:,i+1) - omega_spatial(:,i-1))/(2*dx)
+            !end do
+            
+            !write(*,*) 'absolute difference: dtempdx_spatial (nz_vertical/3,:)'
+            !write(*,*) galerkin_test(nz_vertical/3,:) - dtempdx_spatial(nz_vertical/3,:)
+            !write(*,*)
             
             !Output Galerkin method results:
             !write(*,*) 'Galerkin:'
@@ -530,6 +584,9 @@ module hydro
             !    write(*,'(i5,3ES25.10)') i, nonlinear_temp(nz_vertical/3,i), nonlinear_omega(nz_vertical/3,i)
     		!end do 
             !write(*,*)
+            
+            !Galerkin & spectral transform calculations of nonlinear terms verified to be within machine
+            !precision of each other! (07/31/14)
             
         endif !do_spectral_transform
 
@@ -704,6 +761,7 @@ module hydro
 	subroutine plot_vals
 		integer :: k,n
 		integer :: i1,i2,j1,j2	!Array bounds for PGPLOT
+        real :: rmin, rmax, gmin, gmax, bmin, bmax
 		real :: a1,a2	!Colormap bounds for the plotting
 		integer :: c1,c2,itf
 		double precision :: pgplot_theta	!Rotation angle
@@ -715,8 +773,10 @@ module hydro
 		j1 = 1
 		j2 = nz_vertical
 		!
-		a1 = -0.1e1
-		a2 = 0.1e1
+		!a1 = -0.1e1
+		!a2 = 0.1e1
+        a1 = 0.0
+        a2 = 1.0
 		
 		!Possible transformation matrix for rotated coordinate system:
 		pgplot_theta = 0d0
@@ -729,18 +789,41 @@ module hydro
 		
 		!Transformation matrix:
 		tr = (/0.0, 0.0, 1.0, 0.0, 1.0, 0.0/)	!First index is vertical, second is horizontal
+        
+        !Query and set color indicies:
+        call PGQCIR(c1, c2)
+        !call PGQITF(itf)
+        !write(*,*) c1, c2, itf
+        !itf = 1
+        !call PGSITF(itf)
+        !read(*,*)
 
-		hl = (/0.0, 0.2, 0.4, 0.6, 1.0/)
-		hr = (/0.0, 0.5, 1.0, 1.0, 1.0/)
-		hg = (/0.0, 0.0, 0.5, 1.0, 1.0/) 
-		hb = (/0.0, 0.0, 0.0, 0.3, 1.0/)
-		call pgctab(hl, hr, hg, hb, 5, 1.0, 0.5)
+		!hl = (/0.0, 0.2, 0.4, 0.6, 1.0/)
+		!hr = (/0.0, 0.5, 1.0, 1.0, 1.0/)
+		!hg = (/0.0, 0.0, 0.5, 1.0, 1.0/) 
+		!hb = (/0.0, 0.0, 0.0, 0.3, 1.0/)
+		!hl = (/0.0, 0.25, 0.5, 0.75, 1.0/)
+		!hr = (/0.0, 0.1, 0.8, 1.0, 1.0/)
+		!hg = (/0.0, 0.0, 0.0, 0.0, 0.0/) 
+		!hb = (/1.0, 0.9, 0.2, 0.0, 0.0/)
+		!call pgctab(hl, hr, hg, hb, 5, 1.0, 0.5)
+        rmin = 0.0
+        rmax = 1.0
+        gmin = 0.5
+        gmax = 0.5
+        bmin = 1.0
+        bmax = 0.0
+        do k = c1, c2
+            call PGSCR (k, rmin + (rmax-rmin)*(k-c1)/(c2-c1), &
+                gmin + (gmax-gmin)*(k-c1)/(c2-c1), &
+                bmin + (bmax-bmin)*(k-c1)/(c2-c1))
+        end do
         
         !Transform the horizontal components into real space
 		temp_display(:,:) = 0d0
 		omega_display(:,:) = 0d0
 		!$OMP PARALLEL DO
-		do k=1,nz_vertical
+		do k=0,nz_vertical-1
 			do n=0,nn_horizontal
 				temp_display(:,k) = temp_display(:,k) + temp(:,n)*cos(n*pi*dz*k)
 				omega_display(:,k) = omega_display(:,k) + omega(:,n)*sin(n*pi*dz*k)
