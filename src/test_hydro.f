@@ -23,17 +23,17 @@ module hydro
 	integer, parameter :: nz_vertical = 101	    !Number of spatial vertical zones in simulation
 	integer, parameter :: nn_horizontal = 50	!Number of Fourier modes in the horizontal
     !Number of spatial zones in horizontal (for spectral transform):
-    integer, parameter :: nz_horizontal = 4*nn_horizontal + 1
+    integer, parameter :: nz_horizontal = 3*nn_horizontal + 1
     !Number of zones to use in the DFT in order to get odd modes (pi*n*x/L), rather than just the normal (2*pi*n*x/L) modes:
     integer, parameter :: n_dft = 2*nz_horizontal
 	double precision, parameter :: dz = 1d0/(nz_vertical-1)	!spacing in the z-direction
     double precision, parameter :: dx = 1d0/(nz_horizontal)	!spacing in the x-direction
-	double precision, parameter :: a = 3.0	!horizontal/vertical length scale
+	integer, parameter :: a = 1.0	!horizontal/vertical length scale (integer for FFT'ing)
 	
 	!Timestep parameters:
 	double precision :: dt	!Gets set in initialize()
     double precision :: dt_old  !For recalculating coefficients in Adams-Bashforth
-	double precision, parameter :: fixed_dt = 3e-6	!If >0, then use this as the fixed dt value
+	double precision, parameter :: fixed_dt = 3d-6	!If >0, then use this as the fixed dt value
 	!Number of old time steps to keep track of when time-stepping:
 	integer, parameter :: num_time_differences = 2
 	integer, parameter :: num_steps = 1000000		!Number of time steps to take
@@ -67,9 +67,12 @@ module hydro
         domegadz_spatial, dtempdz_spatial, galerkin_test
         
     !FFTW variables:
-    type(C_PTR) :: fft_plan, ifft_plan, dct_plan, dst_plan !FFT, discrete cosine, and discrete sine transform plans
+    !FFT, discrete cosine, and discrete sine transform plans, real to complex transforms:
+    type(C_PTR) :: fft_plan, ifft_plan, dct_plan, dst_plan, r2c_plan, c2r_plan
+    double precision, dimension(0:n_dft-1) :: in_r2c
+    complex(C_DOUBLE_COMPLEX), dimension(0:n_dft/2) :: out_r2c
     complex(C_DOUBLE_COMPLEX), dimension(0:n_dft-1) :: in_fftw, out_fftw
-    complex(C_DOUBLE_COMPLEX), pointer :: in_aligned(:), out_aligned(:)
+    !complex(C_DOUBLE_COMPLEX), pointer :: in_fftw(:), out_fftw(:)
     type(C_PTR) :: p_in, p_out
 		
 	!PGPLOT variables:
@@ -85,11 +88,21 @@ module hydro
 	
 		integer :: k,n	!Loop indicies
 		integer, dimension(:), pointer :: itime
-		integer :: pgopen, isize
+		integer :: pgopen, isize, c1, c2
 		real :: x1, x2, y1, y2	!PGPLOT window bounds
+      real :: rmin, rmax, gmin, gmax, bmin, bmax  !PGPLOT colors
+      integer :: omp_get_max_threads
 	
 		write(*,*) 'Initializing hydro module!'
 		write(*,*)
+      
+      !Check max number of threads (should be set by $OMP_NUM_THREADS)
+      if(omp_get_max_threads().gt.1) then
+         write(*,*) 'omp_get_num_threads():', omp_get_max_threads()
+         write(*,*) 'Sorry, code is currently not working with multiple threads'
+         write(*,*)
+         stop 1
+      endif
 		
 		!Make sure we satisfy the numerical diffusion limit:
 		if(prandtl.lt.1d0) then
@@ -104,23 +117,23 @@ module hydro
         dt_old = dt
 		
 		write(*,*) 'Domain size parameters:'
-		write(*,'(a25,I25)') 'nn_horizontal:', nn_horizontal
-		write(*,'(a25,I25)') 'nz_vertical:', nz_vertical
-		write(*,'(a25,ES25.10)') 'a (aspect ratio):', a
-		write(*,'(a25,ES25.10)') 'dz:', dz
-		write(*,*)
-		write(*,*) 'Timestep parameters:'
-		write(*,'(a25,ES25.10)') 'dt:', dt
-		write(*,'(a25,I25)') 'num_time_differences:', num_time_differences
-		write(*,'(a25,I25)') 'num_steps:', num_steps
-		write(*,*)
-		write(*,*) 'Physical parameters:'
-		write(*,'(a25,ES25.10)') 'rayleigh:', rayleigh
-		write(*,'(a25,ES25.10)') 'prandtl:', prandtl
-		write(*,*)
-		write(*,*) 'Numerical constants:'
-		write(*,'(a25,ES25.10)') 'pi:', pi
-		write(*,*)
+      write(*,'(a25,I25)') 'nn_horizontal:', nn_horizontal
+      write(*,'(a25,I25)') 'nz_vertical:', nz_vertical
+      !write(*,'(a25,I25)') 'a (aspect ratio):', a
+      write(*,'(a25,ES25.10)') 'dz:', dz
+      write(*,*)
+      write(*,*) 'Timestep parameters:'
+      write(*,'(a25,ES25.10)') 'dt:', dt
+      write(*,'(a25,I25)') 'num_time_differences:', num_time_differences
+      write(*,'(a25,I25)') 'num_steps:', num_steps
+      write(*,*)
+      write(*,*) 'Physical parameters:'
+      write(*,'(a25,ES25.10)') 'rayleigh:', rayleigh
+      write(*,'(a25,ES25.10)') 'prandtl:', prandtl
+      write(*,*)
+      write(*,*) 'Numerical constants:'
+      write(*,'(a25,ES25.10)') 'pi:', pi
+      write(*,*)
 		
 		!Initialize the random number generator
 		call random_seed(size=isize)
@@ -142,10 +155,10 @@ module hydro
 		omega_display(:,:) = 0d0
 		nonlinear_temp(:,:) = 0d0
 		nonlinear_omega(:,:) = 0d0
-        ux_spatial(:,:) = 0d0
-        uz_spatial(:,:) = 0d0
-        temp_spatial(:,:) = 0d0
-        omega_spatial(:,:) = 0d0
+      ux_spatial(:,:) = 0d0
+      uz_spatial(:,:) = 0d0
+      temp_spatial(:,:) = 0d0
+      omega_spatial(:,:) = 0d0
 		dtemp_dt(:,:,:) = 0d0
 		domega_dt(:,:,:) = 0d0
 		dtemp_dz(:,:) = 0d0 
@@ -155,7 +168,6 @@ module hydro
 		domega_dz2(:,:) = 0d0
 		do k=1,nz_vertical
 			z(k) = (k - 1)*dz
-			
 			!Pick a temperature that satisfies the boundary conditions:
 			temp(k,0) = 1d0 - z(k)
 			temp(k,1) = 0.01*sin(pi*z(k))
@@ -175,20 +187,31 @@ module hydro
 		sup(1) = 0d0
 		dia(:) = 1d0	!Only for the boundary conditions 2:nz_vertical-1 will be overwritten
         
-        avg_cfl_x = 0d0
-        avg_cfl_z = 0d0
-        
-        !Create the FFTW plan if we're using the spectral transform method:
-        if(do_spectral_transform) then
-            !The input/output arrays are a single (z) row of the fluid variables since we're only
-            !transforming one dimension (do we need to specify specific arrays here?)
-            !in_fftw = temp_spatial(1,:)
-            !out_fftw = nonlinear_temp(1,:)
-            fft_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_FORWARD, FFTW_ESTIMATE)
-            ifft_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_BACKWARD, FFTW_ESTIMATE)
-            dct_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_REDFT10, FFTW_ESTIMATE)
-            dst_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_RODFT10, FFTW_ESTIMATE)
-        endif
+      avg_cfl_x = 0d0
+      avg_cfl_z = 0d0
+
+      !Create the FFTW plans if we're using the spectral transform method:
+      if(do_spectral_transform) then
+         !Allocate aligned arrays to speed things up (doesn't crash, but isn't agreeing with normal way):
+         !p_in = fftw_alloc_complex(int(n_dft, C_SIZE_T))
+         !call c_f_pointer(p_in, in_fftw, [n_dft])
+         !p_out = fftw_alloc_complex(int(n_dft, C_SIZE_T))
+         !call c_f_pointer(p_out, out_fftw, [n_dft])
+   
+         !Old (C) way:
+         !fft_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_FORWARD, FFTW_PATIENT)
+         !ifft_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_BACKWARD, FFTW_PATIENT)
+         !dct_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_REDFT10, FFTW_ESTIMATE)
+         !dst_plan = fftw_plan_dft_1d(n_dft, in_fftw, out_fftw, FFTW_RODFT10, FFTW_ESTIMATE)
+   
+         !New (Fortran) way:
+         call dfftw_plan_dft_r2c_1d(r2c_plan, n_dft, in_r2c, out_r2c, FFTW_PATIENT)
+         call dfftw_plan_dft_c2r_1d(c2r_plan, n_dft, out_r2c, in_r2c, FFTW_PATIENT)
+         call dfftw_plan_dft_1d(fft_plan, n_dft, in_fftw, out_fftw, FFTW_FORWARD, FFTW_PATIENT)
+         call dfftw_plan_dft_1d(ifft_plan, n_dft, in_fftw, out_fftw, FFTW_BACKWARD, FFTW_PATIENT)
+         call dfftw_plan_dft_1d(dct_plan, n_dft, in_fftw, out_fftw, FFTW_REDFT10, FFTW_ESTIMATE)
+         call dfftw_plan_dft_1d(dst_plan, n_dft, in_fftw, out_fftw, FFTW_RODFT10, FFTW_ESTIMATE)
+      endif
 		
 		!Start up PGPLOT window:
 		if(use_pgplot) then
@@ -201,6 +224,20 @@ module hydro
 			call PGWNAD (1.0, X2, 1.0, Y2)
 			call PGQWIN (X1, X2, Y1, Y2)
 			write(*,*) X1, X2, Y1, Y2
+            
+            !Set up the colors through interpolation
+            call PGQCIR(c1, c2)
+            rmin = 0.0
+            rmax = 1.0
+            gmin = 0.5
+            gmax = 0.5
+            bmin = 1.0
+            bmax = 0.0
+            do k = c1, c2
+                call PGSCR (k, rmin + (rmax-rmin)*(k-c1)/(c2-c1), &
+                    gmin + (gmax-gmin)*(k-c1)/(c2-c1), &
+                    bmin + (bmax-bmin)*(k-c1)/(c2-c1))
+            end do
 		endif
 		
 	end subroutine initialize
@@ -307,12 +344,6 @@ module hydro
 				end do
 			end do
 			!$OMP END PARALLEL DO
-			
-			!Add in the n=0 piece of the nonlinear term:
-            !(removed 7/21/14 beause of double counting in loop above) - now things are breaking around
-            !step 27,200 for the Ch.4 benchmark for initializing n=1 and n=8 modes for nn_horizontal = 50
-            !and breaks around step 7000 for nn_horizontal = 20,
-            !nn_horizontal = 10 went strong for at least 235,000 steps (still going)
             
 		!	!$OMP PARALLEL DO
 			!do i=1,nn_horizontal
@@ -390,11 +421,6 @@ module hydro
     				nonlinear_temp(2:nz_vertical-1,n) = nonlinear_temp(2:nz_vertical-1,n) - &
     					(n*pi/a)*dtemp_dz(2:nz_vertical-1,0)*psi(2:nz_vertical-1,n)
 					
-    				!Now that the nonlinear terms are computed, add them to the time derivatives:
-    				!dtemp_dt(2:nz_vertical-1,n,2) = dtemp_dt(2:nz_vertical-1,n,2) + &
-    				!	nonlinear_temp(2:nz_vertical-1,n)
-    				!domega_dt(2:nz_vertical-1,n,2) = domega_dt(2:nz_vertical-1,n,2) + &
-    				!	nonlinear_omega(2:nz_vertical-1,n)
     				if(dbg) then
     					write(*,*) 'Final nonlinear terms:'
     					write(*,*) n, nonlinear_temp(nz_vertical/3,n), nonlinear_omega(nz_vertical/3,n)
@@ -422,19 +448,19 @@ module hydro
             domegadx_spatial(:,:) = 0d0
             !First step is to convert to spatial coordinates:
             !Convert the horizontal Fourier modes into real space
-        	do i=0,n_dft-1
-        		do n=0,nn_horizontal
-        			ux_spatial(:,i) = ux_spatial(:,i) - dpsi_dz(:,n)*sin(n*pi*dx*i/a)
-        			uz_spatial(:,i) = uz_spatial(:,i) + (n*pi/a)*psi(:,n)*cos(n*pi*dx*i/a)
-                    omega_spatial(:,i) = omega_spatial(:,i) + omega(:,n)*sin(n*pi*dx*i/a)
-                    temp_spatial(:,i) = temp_spatial(:,i) + temp(:,n)*cos(n*pi*dx*i/a)
-                    domegadz_spatial(:,i) = domegadz_spatial(:,i) + domega_dz(:,n)*sin(n*pi*dx*i/a)
-                    dtempdz_spatial(:,i) = dtempdz_spatial(:,i) + dtemp_dz(:,n)*cos(n*pi*dx*i/a)
-                    dtempdx_spatial(:,i) = dtempdx_spatial(:,i) - (n*pi/a)*temp(:,n)*sin(n*pi*dx*i/a)
-                    domegadx_spatial(:,i) = domegadx_spatial(:,i) + (n*pi/a)*omega(:,n)*cos(n*pi*dx*i/a)
-        		end do
-            end do
-            galerkin_test = dtempdx_spatial
+        	!do i=0,n_dft-1
+        	!	do n=0,nn_horizontal
+        	!		ux_spatial(:,i) = ux_spatial(:,i) - dpsi_dz(:,n)*sin(n*pi*dx*i/a)
+        	!		uz_spatial(:,i) = uz_spatial(:,i) + (n*pi/a)*psi(:,n)*cos(n*pi*dx*i/a)
+            !       omega_spatial(:,i) = omega_spatial(:,i) + omega(:,n)*sin(n*pi*dx*i/a)
+            !       temp_spatial(:,i) = temp_spatial(:,i) + temp(:,n)*cos(n*pi*dx*i/a)
+            !       domegadz_spatial(:,i) = domegadz_spatial(:,i) + domega_dz(:,n)*sin(n*pi*dx*i/a)
+            !       dtempdz_spatial(:,i) = dtempdz_spatial(:,i) + dtemp_dz(:,n)*cos(n*pi*dx*i/a)
+            !       dtempdx_spatial(:,i) = dtempdx_spatial(:,i) - (n*pi/a)*temp(:,n)*sin(n*pi*dx*i/a)
+            !       domegadx_spatial(:,i) = domegadx_spatial(:,i) + (n*pi/a)*omega(:,n)*cos(n*pi*dx*i/a)
+        	!	end do
+            !end do
+            !galerkin_test = dtempdx_spatial
             !write(*,*) 'ux_spatial (nz_vertical/3,:) direct sum:'
             !write(*,*) ux_spatial(nz_vertical/3,:)
             !write(*,*)
@@ -457,7 +483,7 @@ module hydro
             !write(*,*) dtempdz_spatial(nz_vertical/3,:)
             !write(*,*)
             
-            !Faster to do this with an inverse FFT:
+            !Faster to do the frequency -> spatial conversion with an inverse FFT:
             do k=1, nz_vertical
                 in_fftw = 0d0
                 in_fftw(0:nn_horizontal) = -dpsi_dz(k,0:nn_horizontal)
@@ -490,6 +516,20 @@ module hydro
                 in_fftw(0:nn_horizontal) = dtemp_dz(k,0:nn_horizontal)
                 call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
                 dtempdz_spatial(k,:) = realpart(out_fftw)
+                
+                in_fftw = 0d0
+                do n=0, nn_horizontal
+                    in_fftw(n) = -(n*pi/a)*temp(k,n)
+                end do
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                dtempdx_spatial(k,:) = imagpart(out_fftw)
+                
+                in_fftw = 0d0
+                do n=0, nn_horizontal
+                    in_fftw(n) = (n*pi/a)*omega(k,n)
+                end do
+                call fftw_execute_dft(ifft_plan, in_fftw, out_fftw)
+                domegadx_spatial(k,:) = realpart(out_fftw)
             end do
             !write(*,*) 'ux_spatial (nz_vertical/3,:) iFFT:'
             !write(*,*) ux_spatial(nz_vertical/3,:)
@@ -559,19 +599,12 @@ module hydro
             do k=1,nz_vertical
                 in_fftw = 0d0
                 in_fftw = -ux_spatial(k,:)*dtempdx_spatial(k,:) - uz_spatial(k,:)*dtempdz_spatial(k,:)
-                !out_fftw = nonlinear_temp(k,:)
                 call fftw_execute_dft(fft_plan, in_fftw, out_fftw)
-                !write(*,*) out_fftw(0:nn_horizontal)
-                !if(mod(k,50).eq.0) then
-                !    write(*,*) in_fftw
-                !    write(*,*) out_fftw
-                !endif
                 nonlinear_temp(k,:) = realpart(out_fftw(0:nn_horizontal))/n_dft
                 nonlinear_temp(k,1:nn_horizontal) = 2*nonlinear_temp(k,1:nn_horizontal) !not sure why yet
                 
                 in_fftw = 0d0
                 in_fftw = -ux_spatial(k,:)*domegadx_spatial(k,:) - uz_spatial(k,:)*domegadz_spatial(k,:)
-                !out_fftw = nonlinear_omega(k,:)
                 call fftw_execute_dft(fft_plan, in_fftw, out_fftw)
                 nonlinear_omega(k,:) = -imagpart(out_fftw(0:nn_horizontal))/n_dft !WHY IS A NEGATIVE SIGN NEEDED HERE?? Perhaps something to do with a complex conjugate somewhere...
                 nonlinear_omega(k,1:nn_horizontal) = 2*nonlinear_omega(k,1:nn_horizontal) !not sure why yet
@@ -680,7 +713,7 @@ module hydro
 			end do
 		end do
         
-        cfl_x = (a/nn_horizontal)/maxval(abs(ux_cfl))
+        cfl_x = (a*1d0/nn_horizontal)/maxval(abs(ux_cfl))
         cfl_z = dz/maxval(abs(uz_cfl))
         !write(*,*) 'max ux_cfl, dx/ux_cfl:', (a/nn_horizontal)/cfl_x, cfl_x
         !write(*,*) 'max uz_cfl, dz/uz_cfl:', dz/cfl_z, cfl_z
@@ -689,7 +722,7 @@ module hydro
         avg_cfl_z = (avg_cfl_z*(step_num/cfl_tick - 1) + cfl_z)/(step_num/cfl_tick)
         
         !Reduce the timestep, if necessary:
-        if((a/nn_horizontal)/maxval(ux_cfl).lt.dt*cfl_timestep_limit_factor) then
+        if((a*1d0/nn_horizontal)/maxval(ux_cfl).lt.dt*cfl_timestep_limit_factor) then
             dt = dt*cfl_reduction_factor
             write(*,*) 'Reducing timestep due to CFL condition (x-direction)', dt
         endif
@@ -761,7 +794,6 @@ module hydro
 	subroutine plot_vals
 		integer :: k,n
 		integer :: i1,i2,j1,j2	!Array bounds for PGPLOT
-        real :: rmin, rmax, gmin, gmax, bmin, bmax
 		real :: a1,a2	!Colormap bounds for the plotting
 		integer :: c1,c2,itf
 		double precision :: pgplot_theta	!Rotation angle
@@ -791,7 +823,7 @@ module hydro
 		tr = (/0.0, 0.0, 1.0, 0.0, 1.0, 0.0/)	!First index is vertical, second is horizontal
         
         !Query and set color indicies:
-        call PGQCIR(c1, c2)
+        !call PGQCIR(c1, c2)
         !call PGQITF(itf)
         !write(*,*) c1, c2, itf
         !itf = 1
@@ -807,17 +839,6 @@ module hydro
 		!hg = (/0.0, 0.0, 0.0, 0.0, 0.0/) 
 		!hb = (/1.0, 0.9, 0.2, 0.0, 0.0/)
 		!call pgctab(hl, hr, hg, hb, 5, 1.0, 0.5)
-        rmin = 0.0
-        rmax = 1.0
-        gmin = 0.5
-        gmax = 0.5
-        bmin = 1.0
-        bmax = 0.0
-        do k = c1, c2
-            call PGSCR (k, rmin + (rmax-rmin)*(k-c1)/(c2-c1), &
-                gmin + (gmax-gmin)*(k-c1)/(c2-c1), &
-                bmin + (bmax-bmin)*(k-c1)/(c2-c1))
-        end do
         
         !Transform the horizontal components into real space
 		temp_display(:,:) = 0d0
@@ -839,7 +860,14 @@ module hydro
 	!Deallocates and cleans up all data, file IO streams, etc.
 	subroutine shutdown
         if(do_spectral_transform) then
+            call fftw_free(p_in)
+            call fftw_free(p_out)
             call fftw_destroy_plan(fft_plan)
+            call fftw_destroy_plan(ifft_plan)
+            call fftw_destroy_plan(dst_plan)
+            call fftw_destroy_plan(dct_plan)
+            call fftw_destroy_plan(r2c_plan)
+            call fftw_destroy_plan(c2r_plan)
         endif
 		call pgclos()
 	end subroutine shutdown
